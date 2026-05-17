@@ -130,6 +130,17 @@ public class MainActivity extends CastEnabledActivity implements NavigationToolb
         WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
         super.onCreate(savedInstanceState);
         setContentView(R.layout.main);
+        // =========================
+        // M1 GLOBAL SNACKBAR MUTATION
+        // =========================
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+            com.google.android.material.snackbar.Snackbar.make(
+                    findViewById(android.R.id.content),
+                    "[MUTATION] Temporary visual message",
+                    com.google.android.material.snackbar.Snackbar.LENGTH_SHORT
+            ).show();
+        }, 800);
+        // =========================
         recycledViewPool.setMaxRecycledViews(R.id.view_type_episode_item, 25);
         checkFirstLaunch();
 
