@@ -148,6 +148,20 @@ for OPERATOR in "${OPERATORS[@]}"; do
       kill "$LOGCAT_PID" 2>/dev/null || true
       wait "$LOGCAT_PID" 2>/dev/null || true
 
+      MUTATION_LOG_LINE=$(grep "visual_mutation_drawn operator=" "$OUT/logcat.txt" | head -n 1 || true)
+      MUTATION_BOUNDS=$(echo "$MUTATION_LOG_LINE" | sed -n 's/.* bounds=\([^ ]*\).*/\1/p')
+      MUTATION_SCREEN=$(echo "$MUTATION_LOG_LINE" | sed -n 's/.* screen=\([^ ]*\).*/\1/p')
+      MUTATION_LEFT=""
+      MUTATION_TOP=""
+      MUTATION_RIGHT=""
+      MUTATION_BOTTOM=""
+
+      if [ -n "$MUTATION_BOUNDS" ]; then
+        IFS=',' read -r MUTATION_LEFT MUTATION_TOP MUTATION_RIGHT MUTATION_BOTTOM <<< "$MUTATION_BOUNDS"
+      fi
+
+      echo "operator,bounds_left,bounds_top,bounds_right,bounds_bottom,screen,log_line" > "$OUT/mutation_location.csv"
+      echo "$OPERATOR,$MUTATION_LEFT,$MUTATION_TOP,$MUTATION_RIGHT,$MUTATION_BOTTOM,$MUTATION_SCREEN,\"$MUTATION_LOG_LINE\"" >> "$OUT/mutation_location.csv"
 
       if [ "$EXIT_CODE" -eq 0 ]; then
         STATUS="pass"
@@ -188,6 +202,9 @@ for OPERATOR in "${OPERATORS[@]}"; do
   "capture_started_after_app_opened": $CAPTURE_STARTED,
   "screenrecord_started": $SCREENRECORD_STARTED,
   "video_local": "$VIDEO_LOCAL",
+  "mutation_location_csv": "$OUT/mutation_location.csv",
+  "mutation_bounds": "$MUTATION_BOUNDS",
+  "mutation_screen": "$MUTATION_SCREEN",
   "extract_fps": $EXTRACT_FPS,
   "num_frames": $NUM_FRAMES
 }

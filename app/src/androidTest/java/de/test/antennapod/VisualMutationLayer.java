@@ -84,7 +84,9 @@ public class VisualMutationLayer extends View {
         }
         if (!mutationLogged) {
             mutationLogged = true;
-            Log.i(TAG, "visual_mutation_drawn operator=" + operator.name());
+            RectF bounds = mutationBounds(width, height, unit, elapsed, actions, editTexts, texts, images, seed);
+            Log.i(TAG, "visual_mutation_drawn operator=" + operator.name() + " bounds=" + formatBounds(bounds)
+                    + " screen=" + width + "x" + height);
         }
 
         switch (operator) {
@@ -160,6 +162,56 @@ public class VisualMutationLayer extends View {
                 return !texts.isEmpty() || !actions.isEmpty() || !images.isEmpty();
             default:
                 return true;
+        }
+    }
+
+    private RectF mutationBounds(int width, int height, float unit, long elapsed, List<RectF> actions,
+                                 List<RectF> editTexts, List<RectF> texts, List<RectF> images, int seed) {
+        switch (operator) {
+            case IPR:
+                return expand(getBoundsOrFallback(editTexts.isEmpty() ? texts : editTexts,
+                        targetIndex(editTexts.isEmpty() ? texts : editTexts, seed), width, height, unit),
+                        unit, width, height);
+            case ITR:
+                RectF start = getBoundsOrFallback(texts, targetIndex(texts, seed), width, height, unit);
+                RectF end = getBoundsOrFallback(actions, targetIndex(actions, seed + 1), width, height, unit);
+                float endY = end.centerY() + (elapsed % 1200 < 600 ? unit : -unit);
+                return union(start, circleBounds(end.centerX(), endY, 7f * unit, width, height));
+            case MDL:
+                return expand(getBoundsOrFallback(texts, targetIndex(texts, seed), width, height, unit),
+                        1.5f * unit, width, height);
+            case ECR:
+                int index = targetIndex(actions, seed);
+                RectF first = getBoundsOrFallback(actions, index, width, height, unit);
+                RectF second = getBoundsOrFallback(actions, index + 1, width, height, unit);
+                return union(first, circleBounds(second.centerX(), second.centerY(),
+                        Math.max(second.width(), second.height()) / 2f + unit, width, height));
+            case ETR:
+                RectF target = getBoundsOrFallback(texts, targetIndex(texts, seed), width, height, unit);
+                RectF touch = circleBounds(target.centerX(), target.centerY(), 5.6f * unit, width, height);
+                return union(touch, circleBounds(width * 0.28f, height * 0.62f, 2.6f * unit, width, height));
+            case APD:
+                return new RectF(2f * unit, height - 8f * unit, width - 2f * unit, height - 2f * unit);
+            case BWD:
+                return expand(getBoundsOrFallback(actions, targetIndex(actions, seed), width, height, unit),
+                        unit / 3f, width, height);
+            case TWD:
+                List<RectF> textTargets = editTexts.isEmpty() ? texts : editTexts;
+                return expand(getBoundsOrFallback(textTargets, targetIndex(textTargets, seed), width, height, unit),
+                        unit / 2f, width, height);
+            case BWS:
+                int switchIndex = targetIndex(actions, seed);
+                return union(getBoundsOrFallback(actions, switchIndex, width, height, unit),
+                        getBoundsOrFallback(actions, switchIndex + 1, width, height, unit));
+            case FON:
+                RectF nullTarget = getBoundsOrFallback(texts, targetIndex(texts, seed), width, height, unit);
+                float left = Math.max(unit, Math.min(nullTarget.left, width - 31f * unit));
+                float top = Math.max(5f * unit, Math.min(nullTarget.bottom + unit, height - 8f * unit));
+                return new RectF(left, top, width - 2f * unit, top + 5.5f * unit);
+            case ORL:
+                return new RectF(0f, 0f, width, height);
+            default:
+                return new RectF(0f, 0f, width, height);
         }
     }
 
@@ -376,6 +428,21 @@ public class VisualMutationLayer extends View {
     private RectF expand(RectF rect, float amount, int width, int height) {
         return new RectF(Math.max(0f, rect.left - amount), Math.max(0f, rect.top - amount),
                 Math.min(width, rect.right + amount), Math.min(height, rect.bottom + amount));
+    }
+
+    private RectF circleBounds(float centerX, float centerY, float radius, int width, int height) {
+        return new RectF(Math.max(0f, centerX - radius), Math.max(0f, centerY - radius),
+                Math.min(width, centerX + radius), Math.min(height, centerY + radius));
+    }
+
+    private RectF union(RectF first, RectF second) {
+        return new RectF(Math.min(first.left, second.left), Math.min(first.top, second.top),
+                Math.max(first.right, second.right), Math.max(first.bottom, second.bottom));
+    }
+
+    private String formatBounds(RectF bounds) {
+        return Math.round(bounds.left) + "," + Math.round(bounds.top) + "," + Math.round(bounds.right) + ","
+                + Math.round(bounds.bottom);
     }
 
     private List<RectF> mergeBounds(List<RectF> first, List<RectF> second) {
