@@ -22,6 +22,7 @@ import java.util.List;
 
 public class VisualMutationLayer extends View {
     private static final String TAG = "VisualMutationLayer";
+    private static final int MARKER_SIZE = 12;
 
     public enum Operator {
         IPR,
@@ -40,7 +41,7 @@ public class VisualMutationLayer extends View {
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final long startedAt = SystemClock.uptimeMillis();
     private final Operator operator;
-    private boolean mutationLogged;
+    private boolean mutationVisible;
 
     public VisualMutationLayer(Context context, Operator operator) {
         super(context);
@@ -78,15 +79,22 @@ public class VisualMutationLayer extends View {
         List<RectF> images = visibleBounds(ImageView.class);
         List<RectF> actions = mergeBounds(buttons, imageButtons);
         int seed = visualSeed(width, height, actions, editTexts, texts, images);
-        if (!shouldDrawMutation(elapsed, seed, actions, editTexts, texts, images)) {
+        boolean shouldDraw = shouldDrawMutation(elapsed, seed, actions, editTexts, texts, images);
+        if (!shouldDraw) {
+            if (mutationVisible) {
+                mutationVisible = false;
+                Log.i(TAG, "visual_mutation_hidden operator=" + operator.name() + " wall_ms="
+                        + System.currentTimeMillis());
+            }
             postInvalidateDelayed(120);
             return;
         }
-        if (!mutationLogged) {
-            mutationLogged = true;
+        if (!mutationVisible) {
+            mutationVisible = true;
             RectF bounds = mutationBounds(width, height, unit, elapsed, actions, editTexts, texts, images, seed);
-            Log.i(TAG, "visual_mutation_drawn operator=" + operator.name() + " bounds=" + formatBounds(bounds)
-                    + " screen=" + width + "x" + height);
+            Log.i(TAG, "visual_mutation_visible operator=" + operator.name() + " bounds=" + formatBounds(bounds)
+                    + " screen=" + width + "x" + height + " marker=" + markerBounds()
+                    + " wall_ms=" + System.currentTimeMillis());
         }
 
         switch (operator) {
@@ -127,6 +135,7 @@ public class VisualMutationLayer extends View {
                 break;
         }
 
+        drawMutationMarker(canvas);
         postInvalidateDelayed(120);
     }
 
@@ -443,6 +452,19 @@ public class VisualMutationLayer extends View {
     private String formatBounds(RectF bounds) {
         return Math.round(bounds.left) + "," + Math.round(bounds.top) + "," + Math.round(bounds.right) + ","
                 + Math.round(bounds.bottom);
+    }
+
+    private void drawMutationMarker(Canvas canvas) {
+        paint.setStyle(Paint.Style.FILL);
+        paint.setColor(Color.rgb(255, 0, 255));
+        canvas.drawRect(0f, 0f, MARKER_SIZE, MARKER_SIZE, paint);
+    }
+
+    private String markerBounds() {
+        int[] location = new int[2];
+        getLocationOnScreen(location);
+        return location[0] + "," + location[1] + "," + (location[0] + MARKER_SIZE) + ","
+                + (location[1] + MARKER_SIZE);
     }
 
     private List<RectF> mergeBounds(List<RectF> first, List<RectF> second) {
