@@ -49,23 +49,60 @@ is_app_foreground() {
   echo "$FOCUS" | grep -q "$APP_PACKAGE"
 }
 
-has_mutation_marker() {
+read_mutation_mask_id() {
   MARKER_X="$2"
   MARKER_Y="$3"
 
   RGB=$(ffmpeg -v error \
     -i "$1" \
-    -vf "crop=12:12:$MARKER_X:$MARKER_Y,scale=1:1,format=rgb24" \
+    -vf "crop=204:12:$MARKER_X:$MARKER_Y,scale=17:1,format=rgb24" \
     -frames:v 1 \
     -f rawvideo - 2>/dev/null \
-    | od -An -tu1 -N 3)
+    | od -An -tu1 -N 51)
 
-  set -- $RGB
-  if [ "$#" -lt 3 ]; then
+  VALUES=($RGB)
+  if [ "${#VALUES[@]}" -lt 51 ]; then
     return 1
   fi
 
-  [ "$1" -ge 180 ] && [ "$2" -le 90 ] && [ "$3" -ge 180 ]
+  if ! { [ "${VALUES[0]}" -ge 180 ] && [ "${VALUES[1]}" -le 90 ] && [ "${VALUES[2]}" -ge 180 ]; }; then
+    return 1
+  fi
+
+  MASK_ID=0
+  for BIT_INDEX in $(seq 0 15); do
+    OFFSET=$(( (BIT_INDEX + 1) * 3 ))
+    BRIGHTNESS=$(( VALUES[OFFSET] + VALUES[OFFSET + 1] + VALUES[OFFSET + 2] ))
+    if [ "$BRIGHTNESS" -ge 384 ]; then
+      MASK_ID=$(( MASK_ID | (1 << (15 - BIT_INDEX)) ))
+    fi
+  done
+
+  echo "$MASK_ID"
+}
+
+remove_mutation_marker() {
+  MARKER_X="$2"
+  MARKER_Y="$3"
+  MARKER_WIDTH=$(( $4 - $2 ))
+  MARKER_HEIGHT=$(( $5 - $3 ))
+  SOURCE_Y=$(( MARKER_Y + MARKER_HEIGHT ))
+  CLEAN_FRAME="$1.clean.png"
+
+  ffmpeg -y -v error \
+    -i "$1" \
+    -filter_complex "[0:v]crop=$MARKER_WIDTH:$MARKER_HEIGHT:$MARKER_X:$SOURCE_Y[patch];[0:v][patch]overlay=$MARKER_X:$MARKER_Y" \
+    "$CLEAN_FRAME" >/dev/null 2>&1 && mv "$CLEAN_FRAME" "$1"
+}
+
+pull_mutation_masks() {
+  MASKS_TMP="$MUTATION_MASKS_JSONL.tmp"
+  adb exec-out run-as "$APP_PACKAGE" cat files/visual_mutation_masks.jsonl > "$MASKS_TMP" 2>/dev/null || true
+  if [ -s "$MASKS_TMP" ]; then
+    mv "$MASKS_TMP" "$MUTATION_MASKS_JSONL"
+  else
+    rm -f "$MASKS_TMP"
+  fi
 }
 
 for OPERATOR in "${OPERATORS[@]}"; do
@@ -83,6 +120,7 @@ for OPERATOR in "${OPERATORS[@]}"; do
 
       VIDEO_REMOTE="/sdcard/${TEST_NAME}_${VERSION}_${RUN_ID}.mp4"
       VIDEO_LOCAL="$OUT/screenrecord.mp4"
+      MUTATION_MASKS_JSONL="$OUT/mutation_masks.jsonl"
 
       echo "timestamp,event,current_focus,reason" > "$OUT/events.csv"
 
@@ -110,10 +148,12 @@ for OPERATOR in "${OPERATORS[@]}"; do
       CAPTURE_STARTED=false
       SCREENRECORD_STARTED=false
       RECORDING_STARTED_MS=""
+      LAST_MASK_PULL_MS=0
 
       while kill -0 "$TEST_PID" 2>/dev/null; do
         FOCUS=$(get_current_focus)
         TIMESTAMP=$(date +%s.%N)
+        NOW_MS=$(date +%s%3N)
 
         if [ "$CAPTURE_STARTED" = false ]; then
           if is_app_foreground "$FOCUS"; then
@@ -143,8 +183,15 @@ for OPERATOR in "${OPERATORS[@]}"; do
           fi
         fi
 
+        if [ "$CAPTURE_STARTED" = true ] && [ $((NOW_MS - LAST_MASK_PULL_MS)) -ge 1000 ]; then
+          pull_mutation_masks
+          LAST_MASK_PULL_MS="$NOW_MS"
+        fi
+
         sleep 0.05
       done
+
+      pull_mutation_masks
 
       wait "$TEST_PID"
       EXIT_CODE=$?
@@ -164,6 +211,10 @@ for OPERATOR in "${OPERATORS[@]}"; do
       if [ "$CAPTURE_STARTED" = true ]; then
         adb pull "$VIDEO_REMOTE" "$VIDEO_LOCAL" >/dev/null 2>&1 || true
         adb shell rm -f "$VIDEO_REMOTE"
+      fi
+
+      if [ ! -f "$MUTATION_MASKS_JSONL" ]; then
+        : > "$MUTATION_MASKS_JSONL"
       fi
 
       kill "$LOGCAT_PID" 2>/dev/null || true
@@ -249,6 +300,7 @@ for OPERATOR in "${OPERATORS[@]}"; do
   "mutation_bounds_csv": "$MUTATION_BOUNDS",
   "mutation_screen": "$MUTATION_SCREEN",
   "mutation_marker": "$MUTATION_MARKER",
+  "mutation_masks_jsonl": "$MUTATION_MASKS_JSONL",
   "mutation_intervals_csv": "$MUTATION_INTERVALS_CSV"
 }
 EOF
@@ -280,7 +332,7 @@ EOF
         echo "[WARN] Video not found: $VIDEO_LOCAL"
       fi
 
-      echo "frame_file,frame_index,frame_time_ms,has_mutation,mutation_type,bounds_left,bounds_top,bounds_right,bounds_bottom,screen" > "$FRAMES_MUTATION_CSV"
+      echo "frame_file,frame_index,frame_time_ms,has_mutation,mutation_type,mask_id,bounds_left,bounds_top,bounds_right,bounds_bottom,screen" > "$FRAMES_MUTATION_CSV"
       : > "$FRAMES_MUTATION_JSONL"
       echo "start_frame_file,end_frame_file,start_frame_index,end_frame_index,mutation_type,bounds_left,bounds_top,bounds_right,bounds_bottom,screen" > "$MUTATION_FRAME_INTERVALS_CSV"
 
@@ -309,6 +361,26 @@ EOF
           INTERVAL_SCREENS+=("$SCREEN")
         done < "$MUTATION_INTERVALS_CSV"
 
+        declare -A MASK_TYPES=()
+        declare -A MASK_LEFTS=()
+        declare -A MASK_TOPS=()
+        declare -A MASK_RIGHTS=()
+        declare -A MASK_BOTTOMS=()
+        declare -A MASK_SCREENS=()
+
+        while IFS= read -r MASK_LINE; do
+          MASK_ID=$(echo "$MASK_LINE" | sed -n 's/.*"mask_id":\([0-9]*\).*/\1/p')
+          if [ -z "$MASK_ID" ]; then
+            continue
+          fi
+          MASK_TYPES[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"mutation_type":"\([^"]*\)".*/\1/p')
+          MASK_LEFTS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"left":\([0-9]*\).*/\1/p')
+          MASK_TOPS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"top":\([0-9]*\).*/\1/p')
+          MASK_RIGHTS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"right":\([0-9]*\).*/\1/p')
+          MASK_BOTTOMS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"bottom":\([0-9]*\).*/\1/p')
+          MASK_SCREENS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"screen":\[\([^]]*\)\].*/\1/p' | tr ',' 'x')
+        done < "$MUTATION_MASKS_JSONL"
+
         FRAME_SEGMENT_INDEX=-1
         PREVIOUS_FRAME_HAS_MUTATION=false
         PREVIOUS_FRAME_NAME=""
@@ -336,8 +408,13 @@ EOF
           FRAME_MUTATION_BOTTOM=""
           FRAME_MUTATION_SCREEN=""
           FRAME_MUTATION_BOUNDS_JSON=null
+          FRAME_MASK_ID=""
 
-          if has_mutation_marker "$FRAME" "$MUTATION_MARKER_LEFT" "$MUTATION_MARKER_TOP"; then
+          FRAME_MASK_ID=$(read_mutation_mask_id "$FRAME" "$MUTATION_MARKER_LEFT" "$MUTATION_MARKER_TOP" || true)
+          if [ -n "$MUTATION_MARKER" ]; then
+            remove_mutation_marker "$FRAME" "$MUTATION_MARKER_LEFT" "$MUTATION_MARKER_TOP" "$MUTATION_MARKER_RIGHT" "$MUTATION_MARKER_BOTTOM"
+          fi
+          if [ -n "$FRAME_MASK_ID" ]; then
             FRAME_HAS_MUTATION=true
 
             if [ "$PREVIOUS_FRAME_HAS_MUTATION" = false ]; then
@@ -346,13 +423,13 @@ EOF
               CURRENT_SEGMENT_START_INDEX="$FRAME_INDEX"
             fi
 
-            if [ "$FRAME_SEGMENT_INDEX" -ge 0 ] && [ "$FRAME_SEGMENT_INDEX" -lt "${#INTERVAL_TYPES[@]}" ]; then
-              FRAME_MUTATION_TYPE="${INTERVAL_TYPES[$FRAME_SEGMENT_INDEX]}"
-              FRAME_MUTATION_LEFT="${INTERVAL_LEFTS[$FRAME_SEGMENT_INDEX]}"
-              FRAME_MUTATION_TOP="${INTERVAL_TOPS[$FRAME_SEGMENT_INDEX]}"
-              FRAME_MUTATION_RIGHT="${INTERVAL_RIGHTS[$FRAME_SEGMENT_INDEX]}"
-              FRAME_MUTATION_BOTTOM="${INTERVAL_BOTTOMS[$FRAME_SEGMENT_INDEX]}"
-              FRAME_MUTATION_SCREEN="${INTERVAL_SCREENS[$FRAME_SEGMENT_INDEX]}"
+            if [ -n "${MASK_TYPES[$FRAME_MASK_ID]:-}" ]; then
+              FRAME_MUTATION_TYPE="${MASK_TYPES[$FRAME_MASK_ID]}"
+              FRAME_MUTATION_LEFT="${MASK_LEFTS[$FRAME_MASK_ID]}"
+              FRAME_MUTATION_TOP="${MASK_TOPS[$FRAME_MASK_ID]}"
+              FRAME_MUTATION_RIGHT="${MASK_RIGHTS[$FRAME_MASK_ID]}"
+              FRAME_MUTATION_BOTTOM="${MASK_BOTTOMS[$FRAME_MASK_ID]}"
+              FRAME_MUTATION_SCREEN="${MASK_SCREENS[$FRAME_MASK_ID]}"
             else
               FRAME_MUTATION_TYPE="$MUTATION_TYPE"
               FRAME_MUTATION_LEFT="$MUTATION_LEFT"
@@ -376,8 +453,8 @@ EOF
             echo "$CURRENT_SEGMENT_START_FRAME,$PREVIOUS_FRAME_NAME,$CURRENT_SEGMENT_START_INDEX,$PREVIOUS_FRAME_INDEX,$CURRENT_SEGMENT_TYPE,$CURRENT_SEGMENT_LEFT,$CURRENT_SEGMENT_TOP,$CURRENT_SEGMENT_RIGHT,$CURRENT_SEGMENT_BOTTOM,$CURRENT_SEGMENT_SCREEN" >> "$MUTATION_FRAME_INTERVALS_CSV"
           fi
 
-          echo "$FRAME_NAME,$FRAME_INDEX,$FRAME_TIME_MS,$FRAME_HAS_MUTATION,$FRAME_MUTATION_TYPE,$FRAME_MUTATION_LEFT,$FRAME_MUTATION_TOP,$FRAME_MUTATION_RIGHT,$FRAME_MUTATION_BOTTOM,$FRAME_MUTATION_SCREEN" >> "$FRAMES_MUTATION_CSV"
-          echo "{\"frame_file\":\"$FRAME_NAME\",\"frame_index\":$FRAME_NUMBER,\"frame_time_ms\":$FRAME_TIME_MS,\"has_mutation\":$FRAME_HAS_MUTATION,\"mutation_type\":\"$FRAME_MUTATION_TYPE\",\"mutation_bounds\":$FRAME_MUTATION_BOUNDS_JSON,\"mutation_screen\":\"$FRAME_MUTATION_SCREEN\"}" >> "$FRAMES_MUTATION_JSONL"
+          echo "$FRAME_NAME,$FRAME_INDEX,$FRAME_TIME_MS,$FRAME_HAS_MUTATION,$FRAME_MUTATION_TYPE,$FRAME_MASK_ID,$FRAME_MUTATION_LEFT,$FRAME_MUTATION_TOP,$FRAME_MUTATION_RIGHT,$FRAME_MUTATION_BOTTOM,$FRAME_MUTATION_SCREEN" >> "$FRAMES_MUTATION_CSV"
+          echo "{\"frame_file\":\"$FRAME_NAME\",\"frame_index\":$FRAME_NUMBER,\"frame_time_ms\":$FRAME_TIME_MS,\"has_mutation\":$FRAME_HAS_MUTATION,\"mutation_type\":\"$FRAME_MUTATION_TYPE\",\"mutation_bounds\":$FRAME_MUTATION_BOUNDS_JSON,\"mutation_screen\":\"$FRAME_MUTATION_SCREEN\",\"mask_id\":\"$FRAME_MASK_ID\",\"mask_rle_ref\":\"$MUTATION_MASKS_JSONL\"}" >> "$FRAMES_MUTATION_JSONL"
 
           PREVIOUS_FRAME_HAS_MUTATION="$FRAME_HAS_MUTATION"
           PREVIOUS_FRAME_NAME="$FRAME_NAME"
@@ -409,11 +486,12 @@ EOF
   "mutation_type": "$MUTATION_TYPE",
   "mutation_location_csv": "$OUT/mutation_location.csv",
   "mutation_json": "$OUT/mutation.json",
+  "mutation_masks_jsonl": "$MUTATION_MASKS_JSONL",
   "mutation_intervals_csv": "$MUTATION_INTERVALS_CSV",
   "mutation_frame_intervals_csv": "$MUTATION_FRAME_INTERVALS_CSV",
   "frames_mutation_csv": "$FRAMES_MUTATION_CSV",
   "frames_mutation_jsonl": "$FRAMES_MUTATION_JSONL",
-  "frame_labels_source": "visual_marker",
+  "frame_labels_source": "visual_marker_mask_id",
   "mutation_bounds": $MUTATION_BOUNDS_JSON,
   "mutation_bounds_csv": "$MUTATION_BOUNDS",
   "mutation_screen": "$MUTATION_SCREEN",

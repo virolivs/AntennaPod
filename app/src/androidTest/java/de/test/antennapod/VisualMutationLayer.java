@@ -1,6 +1,7 @@
 package de.test.antennapod;
 
 import android.content.Context;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
@@ -17,12 +18,16 @@ import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.TextView;
 
+import java.io.File;
+import java.io.FileWriter;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
 public class VisualMutationLayer extends View {
     private static final String TAG = "VisualMutationLayer";
     private static final int MARKER_SIZE = 12;
+    private static boolean maskFileReset;
 
     public enum Operator {
         IPR,
@@ -42,10 +47,12 @@ public class VisualMutationLayer extends View {
     private final long startedAt = SystemClock.uptimeMillis();
     private final Operator operator;
     private boolean mutationVisible;
+    private int maskId;
 
     public VisualMutationLayer(Context context, Operator operator) {
         super(context);
         this.operator = operator;
+        resetMaskFile(context);
         setEnabled(false);
         setWillNotDraw(false);
     }
@@ -89,14 +96,31 @@ public class VisualMutationLayer extends View {
             postInvalidateDelayed(120);
             return;
         }
-        if (!mutationVisible) {
+        boolean becameVisible = !mutationVisible;
+        if (becameVisible) {
             mutationVisible = true;
-            RectF bounds = mutationBounds(width, height, unit, elapsed, actions, editTexts, texts, images, seed);
-            Log.i(TAG, "visual_mutation_visible operator=" + operator.name() + " bounds=" + formatBounds(bounds)
-                    + " screen=" + width + "x" + height + " marker=" + markerBounds()
-                    + " wall_ms=" + System.currentTimeMillis());
         }
+        maskId++;
+        RectF bounds = mutationBounds(width, height, unit, elapsed, actions, editTexts, texts, images, seed);
+        writeMutationMask(maskId, width, height, unit, density, elapsed, actions, editTexts, texts, images, seed,
+                bounds);
+        if (becameVisible) {
+            Log.i(TAG, "visual_mutation_visible operator=" + operator.name() + " mask_id=" + maskId
+                    + " bounds=" + formatBounds(bounds) + " screen=" + width + "x" + height
+                    + " marker=" + markerBounds() + " wall_ms=" + System.currentTimeMillis());
+        }
+        Log.i(TAG, "visual_mutation_frame operator=" + operator.name() + " mask_id=" + maskId
+                + " bounds=" + formatBounds(bounds) + " screen=" + width + "x" + height
+                + " marker=" + markerBounds() + " wall_ms=" + System.currentTimeMillis());
 
+        drawMutation(canvas, width, height, unit, density, elapsed, actions, editTexts, texts, images, seed);
+        drawMutationMarker(canvas, maskId);
+        postInvalidateDelayed(120);
+    }
+
+    private void drawMutation(Canvas canvas, int width, int height, float unit, float density, long elapsed,
+                              List<RectF> actions, List<RectF> editTexts, List<RectF> texts, List<RectF> images,
+                              int seed) {
         switch (operator) {
             case IPR:
                 drawIntentPayloadReplacement(canvas, width, height, unit, density, elapsed, texts, editTexts, seed);
@@ -134,9 +158,6 @@ public class VisualMutationLayer extends View {
             default:
                 break;
         }
-
-        drawMutationMarker(canvas);
-        postInvalidateDelayed(120);
     }
 
     private boolean shouldDrawMutation(long elapsed, int seed, List<RectF> actions, List<RectF> editTexts,
@@ -449,21 +470,96 @@ public class VisualMutationLayer extends View {
                 Math.max(first.right, second.right), Math.max(first.bottom, second.bottom));
     }
 
+    private void writeMutationMask(int id, int width, int height, float unit, float density, long elapsed,
+                                   List<RectF> actions, List<RectF> editTexts, List<RectF> texts,
+                                   List<RectF> images, int seed, RectF bounds) {
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas maskCanvas = new Canvas(bitmap);
+        drawMutation(maskCanvas, width, height, unit, density, elapsed, actions, editTexts, texts, images, seed);
+        File directory = getContext().getFilesDir();
+        if (directory == null) {
+            bitmap.recycle();
+            return;
+        }
+        File file = new File(directory, "visual_mutation_masks.jsonl");
+        try (FileWriter writer = new FileWriter(file, true)) {
+            writer.write("{\"mask_id\":" + id + ",\"mutation_type\":\"" + operator.name() + "\",\"screen\":["
+                    + width + "," + height + "],\"bbox\":{\"left\":" + Math.round(bounds.left)
+                    + ",\"top\":" + Math.round(bounds.top) + ",\"right\":" + Math.round(bounds.right)
+                    + ",\"bottom\":" + Math.round(bounds.bottom)
+                    + "},\"mask\":{\"format\":\"rle\",\"size\":[" + width + "," + height
+                    + "],\"order\":\"row_major\",\"counts\":[" + maskRle(bitmap) + "]}}\n");
+        } catch (IOException e) {
+            Log.w(TAG, "visual_mutation_mask_write_failed", e);
+        } finally {
+            bitmap.recycle();
+        }
+    }
+
+    private static void resetMaskFile(Context context) {
+        if (maskFileReset) {
+            return;
+        }
+        maskFileReset = true;
+        File file = new File(context.getFilesDir(), "visual_mutation_masks.jsonl");
+        if (file.exists() && !file.delete()) {
+            Log.w(TAG, "visual_mutation_mask_reset_failed");
+        }
+    }
+
+    private String maskRle(Bitmap bitmap) {
+        StringBuilder counts = new StringBuilder();
+        int width = bitmap.getWidth();
+        int height = bitmap.getHeight();
+        int[] pixels = new int[width];
+        int current = 0;
+        int count = 0;
+        boolean first = true;
+        for (int y = 0; y < height; y++) {
+            bitmap.getPixels(pixels, 0, width, 0, y, width, 1);
+            for (int x = 0; x < width; x++) {
+                int value = Color.alpha(pixels[x]) > 0 ? 1 : 0;
+                if (value == current) {
+                    count++;
+                } else {
+                    if (!first) {
+                        counts.append(',');
+                    }
+                    counts.append(count);
+                    first = false;
+                    current = value;
+                    count = 1;
+                }
+            }
+        }
+        if (!first) {
+            counts.append(',');
+        }
+        counts.append(count);
+        return counts.toString();
+    }
+
     private String formatBounds(RectF bounds) {
         return Math.round(bounds.left) + "," + Math.round(bounds.top) + "," + Math.round(bounds.right) + ","
                 + Math.round(bounds.bottom);
     }
 
-    private void drawMutationMarker(Canvas canvas) {
+    private void drawMutationMarker(Canvas canvas, int id) {
         paint.setStyle(Paint.Style.FILL);
         paint.setColor(Color.rgb(255, 0, 255));
         canvas.drawRect(0f, 0f, MARKER_SIZE, MARKER_SIZE, paint);
+        for (int i = 0; i < 16; i++) {
+            int bit = (id >> (15 - i)) & 1;
+            paint.setColor(bit == 1 ? Color.WHITE : Color.BLACK);
+            float left = (i + 1) * MARKER_SIZE;
+            canvas.drawRect(left, 0f, left + MARKER_SIZE, MARKER_SIZE, paint);
+        }
     }
 
     private String markerBounds() {
         int[] location = new int[2];
         getLocationOnScreen(location);
-        return location[0] + "," + location[1] + "," + (location[0] + MARKER_SIZE) + ","
+        return location[0] + "," + location[1] + "," + (location[0] + MARKER_SIZE * 17) + ","
                 + (location[1] + MARKER_SIZE);
     }
 
