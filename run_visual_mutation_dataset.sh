@@ -2,7 +2,7 @@
 set -u
 
 APP="AntennaPod"
-RUNS=10
+RUNS=1
 
 APP_PACKAGE="de.danoeh.antennapod.debug"
 
@@ -11,17 +11,16 @@ EXTRACT_FPS=15
 GRADLE_TASK=":app:connectedPlayDebugAndroidTest"
 
 OPERATORS=(
-  "IPR"
-  "ITR"
-  "MDL"
-  "ECR"
-  "ETR"
-  "APD"
-  "BWD"
-  "TWD"
-  "BWS"
-  "FON"
-  "ORL"
+  "TEXT_TRUNCATION"
+  "TEXT_OVERLAP"
+  "COMPONENT_OCCLUSION"
+  "MISSING_IMAGE"
+  "INCORRECT_PLACEHOLDER"
+  "BUTTON_DELETION"
+  "BUTTON_SWAP"
+  "LOW_CONTRAST_TEXT"
+  "PADDING_SHIFT"
+  "ICON_SWAP"
 )
 
 TEST_CLASSES=(
@@ -47,52 +46,6 @@ get_current_focus() {
 is_app_foreground() {
   FOCUS="$1"
   echo "$FOCUS" | grep -q "$APP_PACKAGE"
-}
-
-read_mutation_mask_id() {
-  MARKER_X="$2"
-  MARKER_Y="$3"
-
-  RGB=$(ffmpeg -v error \
-    -i "$1" \
-    -vf "crop=204:12:$MARKER_X:$MARKER_Y,scale=17:1,format=rgb24" \
-    -frames:v 1 \
-    -f rawvideo - 2>/dev/null \
-    | od -An -tu1 -N 51)
-
-  VALUES=($RGB)
-  if [ "${#VALUES[@]}" -lt 51 ]; then
-    return 1
-  fi
-
-  if ! { [ "${VALUES[0]}" -ge 180 ] && [ "${VALUES[1]}" -le 90 ] && [ "${VALUES[2]}" -ge 180 ]; }; then
-    return 1
-  fi
-
-  MASK_ID=0
-  for BIT_INDEX in $(seq 0 15); do
-    OFFSET=$(( (BIT_INDEX + 1) * 3 ))
-    BRIGHTNESS=$(( VALUES[OFFSET] + VALUES[OFFSET + 1] + VALUES[OFFSET + 2] ))
-    if [ "$BRIGHTNESS" -ge 384 ]; then
-      MASK_ID=$(( MASK_ID | (1 << (15 - BIT_INDEX)) ))
-    fi
-  done
-
-  echo "$MASK_ID"
-}
-
-remove_mutation_marker() {
-  MARKER_X="$2"
-  MARKER_Y="$3"
-  MARKER_WIDTH=$(( $4 - $2 ))
-  MARKER_HEIGHT=$(( $5 - $3 ))
-  SOURCE_Y=$(( MARKER_Y + MARKER_HEIGHT ))
-  CLEAN_FRAME="$1.clean.png"
-
-  ffmpeg -y -v error \
-    -i "$1" \
-    -filter_complex "[0:v]crop=$MARKER_WIDTH:$MARKER_HEIGHT:$MARKER_X:$SOURCE_Y[patch];[0:v][patch]overlay=$MARKER_X:$MARKER_Y" \
-    "$CLEAN_FRAME" >/dev/null 2>&1 && mv "$CLEAN_FRAME" "$1"
 }
 
 pull_mutation_masks() {
@@ -148,6 +101,7 @@ for OPERATOR in "${OPERATORS[@]}"; do
       CAPTURE_STARTED=false
       SCREENRECORD_STARTED=false
       RECORDING_STARTED_MS=""
+      RECORDING_STARTED_DEVICE_MS=""
       LAST_MASK_PULL_MS=0
 
       while kill -0 "$TEST_PID" 2>/dev/null; do
@@ -164,6 +118,10 @@ for OPERATOR in "${OPERATORS[@]}"; do
             echo "App opened. Starting screenrecord for $TEST_NAME | $VERSION | $RUN_ID"
 
             RECORDING_STARTED_MS=$(date +%s%3N)
+            RECORDING_STARTED_DEVICE_MS=$(adb shell date +%s%3N 2>/dev/null | tr -d '\r' || true)
+            if [ -z "$RECORDING_STARTED_DEVICE_MS" ]; then
+              RECORDING_STARTED_DEVICE_MS="$RECORDING_STARTED_MS"
+            fi
             adb shell screenrecord "$VIDEO_REMOTE" &
             SCREENRECORD_PID=$!
           else
@@ -223,15 +181,10 @@ for OPERATOR in "${OPERATORS[@]}"; do
       MUTATION_LOG_LINE=$(grep "visual_mutation_visible operator=" "$OUT/logcat.txt" | head -n 1 || true)
       MUTATION_BOUNDS=$(echo "$MUTATION_LOG_LINE" | sed -n 's/.* bounds=\([^ ]*\).*/\1/p')
       MUTATION_SCREEN=$(echo "$MUTATION_LOG_LINE" | sed -n 's/.* screen=\([^ ]*\).*/\1/p')
-      MUTATION_MARKER=$(echo "$MUTATION_LOG_LINE" | sed -n 's/.* marker=\([^ ]*\).*/\1/p')
       MUTATION_LEFT=""
       MUTATION_TOP=""
       MUTATION_RIGHT=""
       MUTATION_BOTTOM=""
-      MUTATION_MARKER_LEFT=0
-      MUTATION_MARKER_TOP=0
-      MUTATION_MARKER_RIGHT=12
-      MUTATION_MARKER_BOTTOM=12
       MUTATION_DETECTED=false
       MUTATION_TYPE=""
       MUTATION_BOUNDS_JSON=null
@@ -241,10 +194,6 @@ for OPERATOR in "${OPERATORS[@]}"; do
         MUTATION_DETECTED=true
         MUTATION_TYPE="$OPERATOR"
         MUTATION_BOUNDS_JSON="{\"left\":$MUTATION_LEFT,\"top\":$MUTATION_TOP,\"right\":$MUTATION_RIGHT,\"bottom\":$MUTATION_BOTTOM}"
-      fi
-
-      if [ -n "$MUTATION_MARKER" ]; then
-        IFS=',' read -r MUTATION_MARKER_LEFT MUTATION_MARKER_TOP MUTATION_MARKER_RIGHT MUTATION_MARKER_BOTTOM <<< "$MUTATION_MARKER"
       fi
 
       echo "has_mutation,mutation_type,bounds_left,bounds_top,bounds_right,bounds_bottom,screen,log_line" > "$OUT/mutation_location.csv"
@@ -299,7 +248,6 @@ for OPERATOR in "${OPERATORS[@]}"; do
   "mutation_bounds": $MUTATION_BOUNDS_JSON,
   "mutation_bounds_csv": "$MUTATION_BOUNDS",
   "mutation_screen": "$MUTATION_SCREEN",
-  "mutation_marker": "$MUTATION_MARKER",
   "mutation_masks_jsonl": "$MUTATION_MASKS_JSONL",
   "mutation_intervals_csv": "$MUTATION_INTERVALS_CSV"
 }
@@ -381,6 +329,44 @@ EOF
           MASK_SCREENS[$MASK_ID]=$(echo "$MASK_LINE" | sed -n 's/.*"screen":\[\([^]]*\)\].*/\1/p' | tr ',' 'x')
         done < "$MUTATION_MASKS_JSONL"
 
+        LOG_MASK_IDS=()
+        LOG_WALL_MS=()
+        LOG_TYPES=()
+        LOG_LEFTS=()
+        LOG_TOPS=()
+        LOG_RIGHTS=()
+        LOG_BOTTOMS=()
+        LOG_SCREENS=()
+
+        while IFS= read -r LINE; do
+          LOG_MASK_ID=$(echo "$LINE" | sed -n 's/.* mask_id=\([0-9]*\).*/\1/p')
+          LOG_WALL=$(echo "$LINE" | sed -n 's/.* wall_ms=\([0-9]*\).*/\1/p')
+          LOG_TYPE=$(echo "$LINE" | sed -n 's/.* operator=\([^ ]*\).*/\1/p')
+          LOG_BOUNDS=$(echo "$LINE" | sed -n 's/.* bounds=\([^ ]*\).*/\1/p')
+          LOG_SCREEN=$(echo "$LINE" | sed -n 's/.* screen=\([^ ]*\).*/\1/p')
+
+          if [ -z "$LOG_MASK_ID" ] || [ -z "$LOG_WALL" ]; then
+            continue
+          fi
+
+          LOG_LEFT=""
+          LOG_TOP=""
+          LOG_RIGHT=""
+          LOG_BOTTOM=""
+          if [ -n "$LOG_BOUNDS" ]; then
+            IFS=',' read -r LOG_LEFT LOG_TOP LOG_RIGHT LOG_BOTTOM <<< "$LOG_BOUNDS"
+          fi
+
+          LOG_MASK_IDS+=("$LOG_MASK_ID")
+          LOG_WALL_MS+=("$LOG_WALL")
+          LOG_TYPES+=("$LOG_TYPE")
+          LOG_LEFTS+=("$LOG_LEFT")
+          LOG_TOPS+=("$LOG_TOP")
+          LOG_RIGHTS+=("$LOG_RIGHT")
+          LOG_BOTTOMS+=("$LOG_BOTTOM")
+          LOG_SCREENS+=("$LOG_SCREEN")
+        done < <(grep "visual_mutation_frame operator=" "$OUT/logcat.txt" || true)
+
         FRAME_SEGMENT_INDEX=-1
         PREVIOUS_FRAME_HAS_MUTATION=false
         PREVIOUS_FRAME_NAME=""
@@ -410,10 +396,25 @@ EOF
           FRAME_MUTATION_BOUNDS_JSON=null
           FRAME_MASK_ID=""
 
-          FRAME_MASK_ID=$(read_mutation_mask_id "$FRAME" "$MUTATION_MARKER_LEFT" "$MUTATION_MARKER_TOP" || true)
-          if [ -n "$MUTATION_MARKER" ]; then
-            remove_mutation_marker "$FRAME" "$MUTATION_MARKER_LEFT" "$MUTATION_MARKER_TOP" "$MUTATION_MARKER_RIGHT" "$MUTATION_MARKER_BOTTOM"
+          FRAME_WALL_MS=$(( RECORDING_STARTED_DEVICE_MS + FRAME_TIME_MS ))
+          BEST_LOG_INDEX=-1
+          BEST_LOG_DELTA=999999999
+
+          for LOG_INDEX in "${!LOG_WALL_MS[@]}"; do
+            DELTA=$(( FRAME_WALL_MS - LOG_WALL_MS[$LOG_INDEX] ))
+            if [ "$DELTA" -lt 0 ]; then
+              DELTA=$(( -DELTA ))
+            fi
+            if [ "$DELTA" -lt "$BEST_LOG_DELTA" ]; then
+              BEST_LOG_DELTA="$DELTA"
+              BEST_LOG_INDEX="$LOG_INDEX"
+            fi
+          done
+
+          if [ "$BEST_LOG_INDEX" -ge 0 ] && [ "$BEST_LOG_DELTA" -le 180 ]; then
+            FRAME_MASK_ID="${LOG_MASK_IDS[$BEST_LOG_INDEX]}"
           fi
+
           if [ -n "$FRAME_MASK_ID" ]; then
             FRAME_HAS_MUTATION=true
 
@@ -431,12 +432,12 @@ EOF
               FRAME_MUTATION_BOTTOM="${MASK_BOTTOMS[$FRAME_MASK_ID]}"
               FRAME_MUTATION_SCREEN="${MASK_SCREENS[$FRAME_MASK_ID]}"
             else
-              FRAME_MUTATION_TYPE="$MUTATION_TYPE"
-              FRAME_MUTATION_LEFT="$MUTATION_LEFT"
-              FRAME_MUTATION_TOP="$MUTATION_TOP"
-              FRAME_MUTATION_RIGHT="$MUTATION_RIGHT"
-              FRAME_MUTATION_BOTTOM="$MUTATION_BOTTOM"
-              FRAME_MUTATION_SCREEN="$MUTATION_SCREEN"
+              FRAME_MUTATION_TYPE="${LOG_TYPES[$BEST_LOG_INDEX]}"
+              FRAME_MUTATION_LEFT="${LOG_LEFTS[$BEST_LOG_INDEX]}"
+              FRAME_MUTATION_TOP="${LOG_TOPS[$BEST_LOG_INDEX]}"
+              FRAME_MUTATION_RIGHT="${LOG_RIGHTS[$BEST_LOG_INDEX]}"
+              FRAME_MUTATION_BOTTOM="${LOG_BOTTOMS[$BEST_LOG_INDEX]}"
+              FRAME_MUTATION_SCREEN="${LOG_SCREENS[$BEST_LOG_INDEX]}"
             fi
 
             if [ -n "$FRAME_MUTATION_LEFT" ]; then
@@ -481,6 +482,7 @@ EOF
   "capture_started_after_app_opened": $CAPTURE_STARTED,
   "screenrecord_started": $SCREENRECORD_STARTED,
   "recording_started_ms": "$RECORDING_STARTED_MS",
+  "recording_started_device_ms": "$RECORDING_STARTED_DEVICE_MS",
   "video_local": "$VIDEO_LOCAL",
   "has_mutation": $MUTATION_DETECTED,
   "mutation_type": "$MUTATION_TYPE",
@@ -491,7 +493,7 @@ EOF
   "mutation_frame_intervals_csv": "$MUTATION_FRAME_INTERVALS_CSV",
   "frames_mutation_csv": "$FRAMES_MUTATION_CSV",
   "frames_mutation_jsonl": "$FRAMES_MUTATION_JSONL",
-  "frame_labels_source": "visual_marker_mask_id",
+  "frame_labels_source": "logcat_wall_time_mask_id",
   "mutation_bounds": $MUTATION_BOUNDS_JSON,
   "mutation_bounds_csv": "$MUTATION_BOUNDS",
   "mutation_screen": "$MUTATION_SCREEN",

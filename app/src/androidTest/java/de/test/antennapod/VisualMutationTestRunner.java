@@ -94,16 +94,16 @@ public class VisualMutationTestRunner extends AndroidJUnitRunner {
 
     private static VisualMutationLayer.Operator getOperator(Bundle arguments) {
         if (arguments == null) {
-            return VisualMutationLayer.Operator.IPR;
+            return VisualMutationLayer.Operator.TEXT_TRUNCATION;
         }
         String operatorName = arguments.getString("visualMutationOperator");
         if (operatorName == null) {
-            return VisualMutationLayer.Operator.IPR;
+            return VisualMutationLayer.Operator.TEXT_TRUNCATION;
         }
         try {
             return VisualMutationLayer.Operator.valueOf(operatorName);
         } catch (IllegalArgumentException e) {
-            return VisualMutationLayer.Operator.IPR;
+            return VisualMutationLayer.Operator.TEXT_TRUNCATION;
         }
     }
 }
