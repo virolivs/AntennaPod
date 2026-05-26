@@ -29,19 +29,20 @@ import java.util.List;
 
 public class VisualMutationLayer extends View {
     private static final String TAG = "VisualMutationLayer";
+    private static final int MAX_TARGETS = 8;
     private static boolean maskFileReset;
 
     public enum Operator {
         TEXT_TRUNCATION,
         TEXT_OVERLAP,
         COMPONENT_OCCLUSION,
-        MISSING_IMAGE,
-        INCORRECT_PLACEHOLDER,
-        BUTTON_DELETION,
-        BUTTON_SWAP,
+        COMPONENT_SWAP,
+        FONT_SCALE_CHANGE,
+        ICON_DELETION,
+        COMPONENT_RESIZE,
         LOW_CONTRAST_TEXT,
         PADDING_SHIFT,
-        ICON_SWAP
+        TEXT_COLOR_CHANGE
     }
 
     private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -50,6 +51,8 @@ public class VisualMutationLayer extends View {
     private boolean mutationVisible;
     private int maskId;
     private boolean capturingCleanFrame;
+    private String currentTargetSignature = "";
+    private long targetStableSince;
 
     private static final class Target {
         final RectF bounds;
@@ -57,13 +60,36 @@ public class VisualMutationLayer extends View {
         final int foregroundColor;
         final String text;
         final String kind;
+        final float textSize;
+        final View view;
 
         Target(RectF bounds, int backgroundColor, int foregroundColor, String text, String kind) {
+            this(bounds, backgroundColor, foregroundColor, text, kind, 0f, null);
+        }
+
+        Target(RectF bounds, int backgroundColor, int foregroundColor, String text, String kind, float textSize) {
+            this(bounds, backgroundColor, foregroundColor, text, kind, textSize, null);
+        }
+
+        Target(RectF bounds, int backgroundColor, int foregroundColor, String text, String kind, float textSize,
+               View view) {
             this.bounds = bounds;
             this.backgroundColor = backgroundColor;
             this.foregroundColor = foregroundColor;
             this.text = text;
             this.kind = kind;
+            this.textSize = textSize;
+            this.view = view;
+        }
+    }
+
+    private static final class TargetPair {
+        final Target first;
+        final Target second;
+
+        TargetPair(Target first, Target second) {
+            this.first = first;
+            this.second = second;
         }
     }
 
@@ -102,12 +128,16 @@ public class VisualMutationLayer extends View {
         float unit = 8f * density;
         List<Target> buttons = visibleTargets(Button.class, "button");
         List<Target> imageButtons = visibleTargets(ImageButton.class, "image_button");
+        List<Target> imageActions = visibleTargets(ImageView.class, "image_action");
         List<Target> editTexts = visibleTargets(EditText.class, "edit_text");
         List<Target> texts = visibleTargets(TextView.class, "text");
         List<Target> images = visibleTargets(ImageView.class, "image");
-        List<Target> actions = mergeTargets(buttons, imageButtons);
+        List<Target> actions = mergeTargets(mergeTargets(buttons, imageButtons), imageActions);
         int seed = visualSeed(width, height, actions, editTexts, texts, images);
-        boolean shouldDraw = shouldDrawMutation(elapsed, seed, actions, editTexts, texts, imageButtons, images);
+        long stableForMs = updateTargetStability(width, height, elapsed, actions, editTexts, texts,
+                imageButtons, images);
+        boolean shouldDraw = shouldDrawMutation(width, height, unit, elapsed, stableForMs, seed, actions,
+                editTexts, texts, imageButtons, images);
         if (!shouldDraw) {
             if (mutationVisible) {
                 mutationVisible = false;
@@ -155,41 +185,55 @@ public class VisualMutationLayer extends View {
                 drawTextOverlap(canvas, width, height, unit, density, texts, seed);
                 break;
             case COMPONENT_OCCLUSION:
-                drawComponentOcclusion(canvas, cleanFrame, width, height, unit, density, actions, texts, images, seed);
+                drawComponentOcclusion(canvas, cleanFrame, width, height, unit, density,
+                        componentOcclusionTargets(width, height, unit, actions, texts), seed);
                 break;
-            case MISSING_IMAGE:
-                drawMissingImage(canvas, cleanFrame, width, height, unit, density, images, seed);
+            case COMPONENT_SWAP:
+                drawComponentSwap(canvas, cleanFrame, width, height, unit, density, actions, texts,
+                        imageButtons, images, seed);
                 break;
-            case INCORRECT_PLACEHOLDER:
-                drawIncorrectPlaceholder(canvas, cleanFrame, width, height, unit, density, texts, editTexts, seed);
+            case FONT_SCALE_CHANGE:
+                drawFontScaleChange(canvas, cleanFrame, width, height, unit, density, editTexts, texts, seed);
                 break;
-            case BUTTON_DELETION:
-                drawButtonDeletion(canvas, cleanFrame, width, height, unit, density, actions, seed);
+            case ICON_DELETION:
+                drawIconDeletion(canvas, cleanFrame, width, height, unit, density, actions, seed);
                 break;
-            case BUTTON_SWAP:
-                drawButtonSwap(canvas, cleanFrame, width, height, unit, density, actions, seed);
+            case COMPONENT_RESIZE:
+                drawComponentResize(canvas, cleanFrame, width, height, unit, density, actions, imageButtons, images, seed);
                 break;
             case LOW_CONTRAST_TEXT:
-                drawLowContrastText(canvas, cleanFrame, width, height, unit, density, editTexts, texts, seed);
+                drawLowContrastText(canvas, cleanFrame, width, height, unit, density, actions, editTexts, texts, seed);
                 break;
             case PADDING_SHIFT:
                 drawPaddingShift(canvas, cleanFrame, width, height, unit, density, actions, texts, seed);
                 break;
-            case ICON_SWAP:
-                drawIconSwap(canvas, cleanFrame, width, height, unit, density, imageButtons, images, seed);
+            case TEXT_COLOR_CHANGE:
+                drawTextColorChange(canvas, cleanFrame, width, height, unit, density, actions, editTexts, texts, seed);
                 break;
             default:
                 break;
         }
     }
 
-    private boolean shouldDrawMutation(long elapsed, int seed, List<Target> actions, List<Target> editTexts,
-                                       List<Target> texts, List<Target> imageButtons, List<Target> images) {
-        if (!hasRequiredTarget(actions, editTexts, texts, imageButtons, images)) {
+    private boolean shouldDrawMutation(int width, int height, float unit, long elapsed, long stableForMs, int seed,
+                                       List<Target> actions, List<Target> editTexts, List<Target> texts,
+                                       List<Target> imageButtons, List<Target> images) {
+        if (!hasRequiredTarget(width, height, unit, actions, editTexts, texts, imageButtons, images)) {
             return false;
         }
-        int gate = Math.abs((seed / 17 + operator.ordinal()) % 5);
-        if (gate == 0) {
+        if (operator == Operator.COMPONENT_RESIZE && stableForMs < 150L) {
+            return false;
+        }
+        if (operator == Operator.FONT_SCALE_CHANGE && stableForMs < 250L) {
+            return false;
+        }
+        if (operator == Operator.PADDING_SHIFT && stableForMs < 150L) {
+            return false;
+        }
+        if (operator == Operator.COMPONENT_OCCLUSION && stableForMs < 180L) {
+            return false;
+        }
+        if (operator == Operator.COMPONENT_SWAP && stableForMs < 180L) {
             return false;
         }
         int period = 2100 + operator.ordinal() * 170;
@@ -197,27 +241,30 @@ public class VisualMutationLayer extends View {
         return (elapsed + Math.abs(seed % period)) % period < active;
     }
 
-    private boolean hasRequiredTarget(List<Target> actions, List<Target> editTexts, List<Target> texts,
+    private boolean hasRequiredTarget(int width, int height, float unit, List<Target> actions, List<Target> editTexts,
+                                      List<Target> texts,
                                       List<Target> imageButtons, List<Target> images) {
         switch (operator) {
-            case BUTTON_SWAP:
-                return actions.size() >= 2;
-            case BUTTON_DELETION:
+            case COMPONENT_RESIZE:
+                return !componentResizeTargets(width, height, unit, actions, imageButtons, images).isEmpty();
+            case ICON_DELETION:
+                return !iconDeletionTargets(actions).isEmpty();
             case PADDING_SHIFT:
-                return !actions.isEmpty();
+                return !paddingShiftTargets(width, height, unit, actions, texts, 0).isEmpty();
             case TEXT_TRUNCATION:
-            case LOW_CONTRAST_TEXT:
                 return !editTexts.isEmpty() || !texts.isEmpty();
+            case LOW_CONTRAST_TEXT:
+                return !editTexts.isEmpty() || !texts.isEmpty() || !actions.isEmpty();
             case TEXT_OVERLAP:
                 return !texts.isEmpty();
-            case INCORRECT_PLACEHOLDER:
+            case FONT_SCALE_CHANGE:
                 return !editTexts.isEmpty() || !texts.isEmpty();
             case COMPONENT_OCCLUSION:
-                return !actions.isEmpty() || !texts.isEmpty() || !images.isEmpty();
-            case MISSING_IMAGE:
-                return !images.isEmpty();
-            case ICON_SWAP:
-                return !imageButtons.isEmpty() || !images.isEmpty();
+                return !componentOcclusionTargets(width, height, unit, actions, texts).isEmpty();
+            case COMPONENT_SWAP:
+                return componentSwapPair(width, height, unit, actions, texts, imageButtons, images, 0) != null;
+            case TEXT_COLOR_CHANGE:
+                return !lowContrastTargets(editTexts, texts, actions).isEmpty();
             default:
                 return true;
         }
@@ -228,33 +275,45 @@ public class VisualMutationLayer extends View {
                                  List<Target> images, int seed) {
         switch (operator) {
             case TEXT_TRUNCATION:
-            case LOW_CONTRAST_TEXT:
                 List<Target> textTargets = editTexts.isEmpty() ? texts : editTexts;
                 return expand(targetOrFallback(textTargets, targetIndex(textTargets, seed), width, height, unit).bounds,
                         unit / 3f, width, height);
+            case LOW_CONTRAST_TEXT:
+                List<Target> contrastTargets = lowContrastTargets(editTexts, texts, actions);
+                return expand(targetOrFallback(contrastTargets, targetIndex(contrastTargets, seed),
+                        width, height, unit).bounds, unit / 3f, width, height);
             case TEXT_OVERLAP:
-            case INCORRECT_PLACEHOLDER:
-                List<Target> placeholderTargets = editTexts.isEmpty() ? texts : editTexts;
-                return expand(targetOrFallback(placeholderTargets, targetIndex(placeholderTargets, seed),
+                return expand(targetOrFallback(texts, targetIndex(texts, seed),
                         width, height, unit).bounds, unit / 2f, width, height);
+            case FONT_SCALE_CHANGE:
+                List<Target> fontTargets = textTargets(editTexts, texts);
+                return expand(targetOrFallback(fontTargets, targetIndex(fontTargets, seed),
+                        width, height, unit).bounds, unit, width, height);
             case COMPONENT_OCCLUSION:
-                return componentTargetBounds(width, height, unit, actions, texts, images, seed);
-            case MISSING_IMAGE:
-                return expand(targetOrFallback(images, targetIndex(images, seed), width, height, unit).bounds,
-                        unit / 4f, width, height);
-            case BUTTON_DELETION:
-                return expand(targetOrFallback(actions, targetIndex(actions, seed), width, height, unit).bounds,
-                        unit / 3f, width, height);
-            case BUTTON_SWAP:
-                int switchIndex = targetIndex(actions, seed);
-                return union(targetOrFallback(actions, switchIndex, width, height, unit).bounds,
-                        targetOrFallback(actions, switchIndex + 1, width, height, unit).bounds);
+                return componentOccluderBounds(width, height, unit,
+                        componentOcclusionTargets(width, height, unit, actions, texts), seed);
+            case COMPONENT_SWAP:
+                TargetPair swapPair = componentSwapPair(width, height, unit, actions, texts, imageButtons, images, seed);
+                if (swapPair != null) {
+                    return expand(union(swapPair.first.bounds, swapPair.second.bounds), unit / 4f, width, height);
+                }
+                return new RectF(0f, 0f, width, height);
+            case ICON_DELETION:
+                List<Target> deletionTargets = iconDeletionTargets(actions);
+                return targetOrFallback(deletionTargets, targetIndex(deletionTargets, seed), width, height, unit).bounds;
+            case COMPONENT_RESIZE:
+                List<Target> resizeTargets = componentResizeTargets(width, height, unit, actions, imageButtons, images);
+                Target resizeTarget = targetOrFallback(resizeTargets, targetIndex(resizeTargets, seed),
+                        width, height, unit);
+                return union(resizeTarget.bounds, componentResizeDestination(resizeTarget.bounds, unit, seed, width, height));
             case PADDING_SHIFT:
-                return expand(targetOrFallback(actions, targetIndex(actions, seed), width, height, unit).bounds,
-                        1.2f * unit, width, height);
-            case ICON_SWAP:
-                List<Target> iconTargets = imageButtons.isEmpty() ? images : imageButtons;
-                return expand(targetOrFallback(iconTargets, targetIndex(iconTargets, seed), width, height, unit).bounds,
+                List<Target> paddingTargets = paddingShiftTargets(width, height, unit, actions, texts, seed);
+                Target paddingTarget = targetOrFallback(paddingTargets, targetIndex(paddingTargets, seed),
+                        width, height, unit);
+                return union(paddingTarget.bounds, paddingShiftDestination(paddingTarget.bounds, unit, seed, width, height));
+            case TEXT_COLOR_CHANGE:
+                List<Target> textColorTargets = lowContrastTargets(editTexts, texts, actions);
+                return expand(targetOrFallback(textColorTargets, targetIndex(textColorTargets, seed), width, height, unit).bounds,
                         unit / 4f, width, height);
             default:
                 return new RectF(0f, 0f, width, height);
@@ -276,6 +335,43 @@ public class VisualMutationLayer extends View {
             seed = seed * 31 + Math.round(bound.left + bound.top + bound.right + bound.bottom);
         }
         return seed;
+    }
+
+    private long updateTargetStability(int width, int height, long elapsed, List<Target> actions,
+                                       List<Target> editTexts, List<Target> texts,
+                                       List<Target> imageButtons, List<Target> images) {
+        String signature = targetSignature(width, height, actions, editTexts, texts, imageButtons, images);
+        if (!signature.equals(currentTargetSignature)) {
+            currentTargetSignature = signature;
+            targetStableSince = elapsed;
+            return 0L;
+        }
+        return elapsed - targetStableSince;
+    }
+
+    private String targetSignature(int width, int height, List<Target> actions, List<Target> editTexts,
+                                   List<Target> texts, List<Target> imageButtons, List<Target> images) {
+        StringBuilder signature = new StringBuilder();
+        signature.append(width).append('x').append(height);
+        appendTargetSignature(signature, "a", actions);
+        appendTargetSignature(signature, "e", editTexts);
+        appendTargetSignature(signature, "t", texts);
+        appendTargetSignature(signature, "ib", imageButtons);
+        appendTargetSignature(signature, "i", images);
+        return signature.toString();
+    }
+
+    private void appendTargetSignature(StringBuilder signature, String prefix, List<Target> targets) {
+        signature.append('|').append(prefix).append(':').append(targets.size());
+        for (Target target : targets) {
+            RectF bounds = target.bounds;
+            signature.append('@')
+                    .append(Math.round(bounds.left / 8f)).append(',')
+                    .append(Math.round(bounds.top / 8f)).append(',')
+                    .append(Math.round(bounds.right / 8f)).append(',')
+                    .append(Math.round(bounds.bottom / 8f)).append(',')
+                    .append(clippedText(target.text, 12).hashCode());
+        }
     }
 
     private void drawTextTruncation(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
@@ -305,138 +401,746 @@ public class VisualMutationLayer extends View {
     }
 
     private void drawComponentOcclusion(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
-                                        float density, List<Target> actions, List<Target> texts,
-                                        List<Target> images, int seed) {
-        Target target = componentTarget(width, height, unit, actions, texts, images, seed);
+                                        float density, List<Target> targets, int seed) {
+        if (targets.isEmpty()) {
+            return;
+        }
+        Target target = componentTarget(width, height, unit, targets, seed);
         RectF bounds = target.bounds;
-        RectF occluder = new RectF(bounds.left + bounds.width() * 0.18f, bounds.top + bounds.height() * 0.2f,
-                bounds.right - bounds.width() * 0.08f, bounds.bottom - bounds.height() * 0.12f);
+        RectF occluder = componentOccluder(bounds, unit, seed, width, height);
         paint.setStyle(Paint.Style.FILL);
         paint.setColor(sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit));
         canvas.drawRoundRect(occluder, unit / 2f, unit / 2f, paint);
     }
 
-    private void drawMissingImage(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
-                                  List<Target> images, int seed) {
-        Target target = targetOrFallback(images, targetIndex(images, seed), width, height, unit);
-        RectF bounds = target.bounds;
-        int background = sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(background);
-        canvas.drawRect(expand(bounds, unit / 4f, width, height), paint);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(unit / 5f);
-        paint.setColor(blend(background, Color.rgb(120, 120, 120), 0.45f));
-        canvas.drawRect(bounds, paint);
-        canvas.drawLine(bounds.left, bounds.top, bounds.right, bounds.bottom, paint);
-        canvas.drawLine(bounds.right, bounds.top, bounds.left, bounds.bottom, paint);
-    }
-
-    private void drawIncorrectPlaceholder(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
-                                          float density, List<Target> texts, List<Target> editTexts, int seed) {
-        List<Target> targets = editTexts.isEmpty() ? texts : editTexts;
+    private void drawFontScaleChange(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
+                                     float density, List<Target> editTexts, List<Target> texts, int seed) {
+        List<Target> targets = textTargets(editTexts, texts);
         Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
-        RectF box = expand(target.bounds, unit / 2f, width, height);
-        int background = sampleBackgroundColor(cleanFrame, target.bounds, target.backgroundColor, unit);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(background);
-        canvas.drawRect(box, paint);
-        paint.setColor(blend(background, target.foregroundColor, 0.28f));
-        canvas.drawRoundRect(new RectF(box.left + unit / 2f, box.centerY() - unit / 4f,
-                Math.min(box.right - unit / 2f, box.left + 15f * unit), box.centerY() + unit / 4f),
-                unit / 4f, unit / 4f, paint);
+        RectF bounds = target.bounds;
+        Rect source = bitmapRect(cleanFrame, bounds);
+        if (cleanFrame == null || cleanFrame.isRecycled() || source.isEmpty()) {
+            return;
+        }
+        int background = sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit);
+        Bitmap textPixels = textPixelBitmap(cleanFrame, source, background, false);
+        Bitmap erasePixels = textPixelBitmap(cleanFrame, source, background, true);
+        if (textPixels == null || erasePixels == null) {
+            return;
+        }
+        canvas.drawBitmap(erasePixels, source.left, source.top, paint);
+        float scale = Math.abs(seed) % 2 == 0 ? 1.22f : 0.82f;
+        float destWidth = Math.max(1f, source.width() * scale);
+        float destHeight = Math.max(1f, source.height() * scale);
+        RectF destination = new RectF(
+                source.left,
+                source.exactCenterY() - destHeight / 2f,
+                Math.min(width, source.left + destWidth),
+                Math.min(height, source.exactCenterY() + destHeight / 2f));
+        paint.setAlpha(255);
+        canvas.drawBitmap(textPixels, null, destination, paint);
+        textPixels.recycle();
+        erasePixels.recycle();
     }
 
-    private void drawButtonDeletion(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
-                                    List<Target> actions, int seed) {
-        Target target = targetOrFallback(actions, targetIndex(actions, seed), width, height, unit);
+    private void drawIconDeletion(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
+                                  List<Target> actions, int seed) {
+        List<Target> targets = iconDeletionTargets(actions);
+        Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
+        Bitmap hiddenFrame = captureFrameWithHiddenView(target.view, width, height);
+        Rect source = bitmapRect(hiddenFrame, target.bounds);
+        if (hiddenFrame != null && !hiddenFrame.isRecycled() && !source.isEmpty()) {
+            paint.setAlpha(255);
+            canvas.drawBitmap(hiddenFrame, source, new RectF(source), paint);
+            hiddenFrame.recycle();
+            return;
+        }
         paint.setStyle(Paint.Style.FILL);
         paint.setColor(sampleBackgroundColor(cleanFrame, target.bounds, target.backgroundColor, unit));
-        canvas.drawRoundRect(expand(target.bounds, unit / 3f, width, height), unit / 2f, unit / 2f, paint);
+        canvas.drawRect(target.bounds, paint);
     }
 
-    private void drawButtonSwap(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
-                                List<Target> actions, int seed) {
-        int index = targetIndex(actions, seed);
-        Target first = targetOrFallback(actions, index, width, height, unit);
-        Target second = targetOrFallback(actions, index + 1, width, height, unit);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(sampleBackgroundColor(cleanFrame, first.bounds, first.backgroundColor, unit));
-        canvas.drawRoundRect(first.bounds, unit / 2f, unit / 2f, paint);
-        paint.setColor(sampleBackgroundColor(cleanFrame, second.bounds, second.backgroundColor, unit));
-        canvas.drawRoundRect(second.bounds, unit / 2f, unit / 2f, paint);
-        drawTargetText(canvas, first.bounds, second.text, first.foregroundColor, density, unit);
-        drawTargetText(canvas, second.bounds, first.text, second.foregroundColor, density, unit);
+    private void drawComponentResize(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
+                                     float density, List<Target> actions, List<Target> imageButtons,
+                                     List<Target> images, int seed) {
+        List<Target> targets = componentResizeTargets(width, height, unit, actions, imageButtons, images);
+        Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
+        Rect source = bitmapRect(cleanFrame, target.bounds);
+        if (cleanFrame == null || cleanFrame.isRecycled() || source.isEmpty()) {
+            return;
+        }
+        int background = sampleBackgroundColor(cleanFrame, target.bounds, target.backgroundColor, unit);
+        Bitmap contentPixels = visiblePixelBitmap(cleanFrame, source, background, false);
+        Bitmap erasePixels = visiblePixelBitmap(cleanFrame, source, background, true);
+        if (contentPixels == null || erasePixels == null) {
+            return;
+        }
+        RectF destination = componentResizeDestination(target.bounds, unit, seed, width, height);
+        paint.setAlpha(255);
+        canvas.drawBitmap(erasePixels, source.left, source.top, paint);
+        canvas.drawBitmap(contentPixels, null, destination, paint);
+        contentPixels.recycle();
+        erasePixels.recycle();
     }
 
     private void drawLowContrastText(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
-                                     List<Target> editTexts, List<Target> texts, int seed) {
-        List<Target> targets = editTexts.isEmpty() ? texts : editTexts;
+                                     List<Target> actions, List<Target> editTexts, List<Target> texts, int seed) {
+        List<Target> targets = lowContrastTargets(editTexts, texts, actions);
         Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
         RectF bounds = target.bounds;
+        Rect source = bitmapRect(cleanFrame, bounds);
+        if (cleanFrame == null || cleanFrame.isRecycled() || source.isEmpty()) {
+            return;
+        }
         int background = sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(background);
-        canvas.drawRect(expand(bounds, unit / 3f, width, height), paint);
-        paint.setColor(blend(background, target.foregroundColor, 0.18f));
-        paint.setTextSize(textSizeFor(bounds, density));
-        canvas.drawText(clippedText(target.text, 24), bounds.left + unit / 4f, textBaseline(bounds), paint);
+        Bitmap lowContrastText = lowContrastTextBitmap(cleanFrame, source, background);
+        if (lowContrastText == null) {
+            return;
+        }
+        canvas.drawBitmap(lowContrastText, source.left, source.top, paint);
+        lowContrastText.recycle();
+        paint.setAlpha(255);
     }
 
     private void drawPaddingShift(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
                                   List<Target> actions, List<Target> texts, int seed) {
-        List<Target> targets = actions.isEmpty() ? texts : actions;
+        List<Target> targets = paddingShiftTargets(width, height, unit, actions, texts, seed);
         Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
-        RectF box = expand(target.bounds, unit / 2f, width, height);
-        paint.setStyle(Paint.Style.FILL);
-        paint.setColor(sampleBackgroundColor(cleanFrame, target.bounds, target.backgroundColor, unit));
-        canvas.drawRoundRect(box, unit / 2f, unit / 2f, paint);
-        RectF shifted = new RectF(Math.min(width - unit, target.bounds.left + unit), target.bounds.top,
-                Math.min(width, target.bounds.right + unit), target.bounds.bottom);
-        drawTargetText(canvas, shifted, target.text, target.foregroundColor, density, unit);
+        RectF bounds = target.bounds;
+        Rect source = bitmapRect(cleanFrame, bounds);
+        RectF shifted = paddingShiftDestination(bounds, unit, seed, width, height);
+        if (cleanFrame != null && !cleanFrame.isRecycled() && !source.isEmpty()) {
+            int background = sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit);
+            Bitmap contentPixels = textPixelBitmap(cleanFrame, source, background, false);
+            Bitmap erasePixels = textPixelBitmap(cleanFrame, source, background, true);
+            if (contentPixels != null && erasePixels != null) {
+                canvas.drawBitmap(erasePixels, source.left, source.top, paint);
+                canvas.drawBitmap(contentPixels, null, shifted, paint);
+                contentPixels.recycle();
+                erasePixels.recycle();
+                return;
+            }
+        }
+        paint.setColor(target.foregroundColor);
+        paint.setTextSize(targetTextSize(target, target.bounds, density));
+        canvas.drawText(clippedText(target.text, 22), shifted.left + unit / 2f, textBaseline(shifted), paint);
     }
 
-    private void drawIconSwap(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit, float density,
-                              List<Target> imageButtons, List<Target> images, int seed) {
-        List<Target> targets = imageButtons.isEmpty() ? images : imageButtons;
+    private void drawTextColorChange(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
+                                     float density, List<Target> actions, List<Target> editTexts,
+                                     List<Target> texts, int seed) {
+        List<Target> targets = lowContrastTargets(editTexts, texts, actions);
         Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
         RectF bounds = target.bounds;
         int background = sampleBackgroundColor(cleanFrame, bounds, target.backgroundColor, unit);
-        float radius = Math.max(unit, Math.min(bounds.width(), bounds.height()) * 0.34f);
+        Rect source = bitmapRect(cleanFrame, bounds);
+        if (cleanFrame == null || cleanFrame.isRecycled() || source.isEmpty()) {
+            return;
+        }
+        int replacement = distinctMutationColor(seed, background, target.foregroundColor);
+        Bitmap recoloredText = recoloredVisibleBitmap(cleanFrame, source, background, replacement);
+        if (recoloredText == null) {
+            return;
+        }
+        paint.setAlpha(255);
+        canvas.drawBitmap(recoloredText, source.left, source.top, paint);
+        recoloredText.recycle();
+    }
+
+    private void drawComponentSwap(Canvas canvas, Bitmap cleanFrame, int width, int height, float unit,
+                                   float density, List<Target> actions, List<Target> texts,
+                                   List<Target> imageButtons, List<Target> images, int seed) {
+        TargetPair pair = componentSwapPair(width, height, unit, actions, texts, imageButtons, images, seed);
+        if (pair == null || cleanFrame == null || cleanFrame.isRecycled()) {
+            return;
+        }
+        Rect firstSource = bitmapRect(cleanFrame, pair.first.bounds);
+        Rect secondSource = bitmapRect(cleanFrame, pair.second.bounds);
+        if (firstSource.isEmpty() || secondSource.isEmpty()) {
+            return;
+        }
+        eraseTarget(canvas, cleanFrame, pair.first.bounds, pair.first.backgroundColor, unit);
+        eraseTarget(canvas, cleanFrame, pair.second.bounds, pair.second.backgroundColor, unit);
+        paint.setAlpha(255);
+        canvas.drawBitmap(cleanFrame, firstSource, pair.second.bounds, paint);
+        canvas.drawBitmap(cleanFrame, secondSource, pair.first.bounds, paint);
+    }
+
+    private RectF componentOccluderBounds(int width, int height, float unit, List<Target> targets, int seed) {
+        if (targets.isEmpty()) {
+            return new RectF(0f, 0f, 0f, 0f);
+        }
+        Target target = componentTarget(width, height, unit, targets, seed);
+        return componentOccluder(target.bounds, unit, seed, width, height);
+    }
+
+    private Target componentTarget(int width, int height, float unit, List<Target> targets, int seed) {
+        Target target = targetOrFallback(targets, targetIndex(targets, seed), width, height, unit);
+        return new Target(target.bounds, target.backgroundColor, target.foregroundColor, target.text,
+                target.kind, target.textSize, target.view);
+    }
+
+    private List<Target> componentOcclusionTargets(int width, int height, float unit, List<Target> actions,
+                                                   List<Target> texts) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : texts) {
+            if (target.text == null || target.text.trim().isEmpty()) {
+                continue;
+            }
+            if (isReasonableOcclusionTarget(width, height, unit, target.bounds)) {
+                targets.add(target);
+            }
+        }
+        if (!targets.isEmpty()) {
+            return targets;
+        }
+        for (Target target : actions) {
+            if (!"button".equals(target.kind) || target.text == null || target.text.trim().isEmpty()) {
+                continue;
+            }
+            if (isReasonableOcclusionTarget(width, height, unit, target.bounds)) {
+                targets.add(target);
+            }
+        }
+        return targets;
+    }
+
+    private boolean isReasonableOcclusionTarget(int width, int height, float unit, RectF bounds) {
+        if (bounds.width() < unit * 3.5f || bounds.height() < unit * 1.2f) {
+            return false;
+        }
+        if (bounds.width() > width * 0.72f || bounds.height() > unit * 8f) {
+            return false;
+        }
+        if (bounds.top < unit * 6.5f || bounds.bottom > height - unit * 7f) {
+            return false;
+        }
+        return bounds.left >= unit && bounds.right <= width - unit;
+    }
+
+    private RectF componentOccluder(RectF bounds, float unit, int seed, int width, int height) {
+        float widthRatio = Math.abs(seed) % 2 == 0 ? 0.50f : 0.62f;
+        float heightRatio = Math.abs(seed / 3) % 2 == 0 ? 0.48f : 0.60f;
+        float occluderW = Math.max(unit * 3f, Math.min(bounds.width() * widthRatio, unit * 8f));
+        float occluderH = Math.max(unit * 1.1f, Math.min(bounds.height() * heightRatio, unit * 3f));
+        float offsetX = Math.abs(seed) % 2 == 0 ? 0.18f : 0.52f;
+        float offsetY = Math.abs(seed / 5) % 2 == 0 ? 0.16f : 0.46f;
+        float left = bounds.left + (bounds.width() - occluderW) * offsetX;
+        float top = bounds.top + (bounds.height() - occluderH) * offsetY;
+        return new RectF(
+                Math.max(0f, left),
+                Math.max(0f, top),
+                Math.min(width, left + occluderW),
+                Math.min(height, top + occluderH));
+    }
+
+    private List<Target> componentImages(int width, int height, float unit, List<Target> images) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : images) {
+            RectF bounds = target.bounds;
+            float shorterSide = Math.min(bounds.width(), bounds.height());
+            float longerSide = Math.max(bounds.width(), bounds.height());
+            if (shorterSide < unit * 1.2f || longerSide > unit * 10f) {
+                continue;
+            }
+            if (longerSide > 0f && shorterSide / longerSide < 0.35f) {
+                continue;
+            }
+            if (bounds.bottom > height - unit * 3f || bounds.left < 0f || bounds.right > width) {
+                continue;
+            }
+            targets.add(target);
+        }
+        return targets;
+    }
+
+    private List<Target> contentImages(int width, int height, float unit, List<Target> images) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : images) {
+            RectF bounds = target.bounds;
+            float shorterSide = Math.min(bounds.width(), bounds.height());
+            float longerSide = Math.max(bounds.width(), bounds.height());
+            if (bounds.width() < 6f * unit || bounds.height() < 6f * unit) {
+                continue;
+            }
+            if (bounds.top < 5f * unit || bounds.bottom > height - 5f * unit) {
+                continue;
+            }
+            if (longerSide > 0f && shorterSide / longerSide < 0.22f) {
+                continue;
+            }
+            if (bounds.left < 0f || bounds.right > width) {
+                continue;
+            }
+            targets.add(target);
+        }
+        return targets;
+    }
+
+    private TargetPair componentSwapPair(int width, int height, float unit, List<Target> actions,
+                                         List<Target> texts, List<Target> imageButtons, List<Target> images,
+                                         int seed) {
+        List<Target> targets = componentSwapTargets(width, height, unit, actions, texts, imageButtons, images);
+        if (targets.size() < 2) {
+            return null;
+        }
+        TargetPair sameKindPair = findComponentSwapPair(targets, seed, true, true, unit);
+        if (sameKindPair != null) {
+            return sameKindPair;
+        }
+        TargetPair distinctPair = findComponentSwapPair(targets, seed, false, true, unit);
+        if (distinctPair != null) {
+            return distinctPair;
+        }
+        sameKindPair = findComponentSwapPair(targets, seed, true, false, unit);
+        if (sameKindPair != null) {
+            return sameKindPair;
+        }
+        return findComponentSwapPair(targets, seed, false, false, unit);
+    }
+
+    private TargetPair findComponentSwapPair(List<Target> targets, int seed, boolean sameKindOnly,
+                                             boolean distinctOnly, float unit) {
+        int start = targetIndex(targets, seed);
+        for (int offset = 0; offset < targets.size(); offset++) {
+            Target first = targets.get((start + offset) % targets.size());
+            for (int distance = 1; distance < targets.size(); distance++) {
+                Target second = targets.get((start + offset + distance) % targets.size());
+                if (isCompatibleSwapPair(first, second, sameKindOnly, distinctOnly, unit)) {
+                    return new TargetPair(first, second);
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean isCompatibleSwapPair(Target first, Target second, boolean sameKindOnly,
+                                         boolean distinctOnly, float unit) {
+        if (first == second || first.view == second.view) {
+            return false;
+        }
+        if (sameKindOnly && !first.kind.equals(second.kind)) {
+            return false;
+        }
+        if (distinctOnly && !hasDistinctSwapContent(first, second)) {
+            return false;
+        }
+        if (significantOverlap(first.bounds, second.bounds, unit)) {
+            return false;
+        }
+        float widthRatio = ratio(first.bounds.width(), second.bounds.width());
+        float heightRatio = ratio(first.bounds.height(), second.bounds.height());
+        if (widthRatio < 0.65f || heightRatio < 0.65f) {
+            return false;
+        }
+        float verticalGap = Math.abs(first.bounds.centerY() - second.bounds.centerY());
+        float horizontalGap = Math.abs(first.bounds.centerX() - second.bounds.centerX());
+        float maxHeight = Math.max(first.bounds.height(), second.bounds.height());
+        float maxWidth = Math.max(first.bounds.width(), second.bounds.width());
+        return verticalGap <= Math.max(unit * 3f, maxHeight * 2.5f)
+                || horizontalGap <= Math.max(unit * 3f, maxWidth * 2.5f);
+    }
+
+    private boolean hasDistinctSwapContent(Target first, Target second) {
+        String firstText = first.text == null ? "" : first.text.trim();
+        String secondText = second.text == null ? "" : second.text.trim();
+        if (!firstText.isEmpty() && !secondText.isEmpty()) {
+            return !firstText.equals(secondText);
+        }
+        return !first.kind.equals(second.kind);
+    }
+
+    private float ratio(float first, float second) {
+        float larger = Math.max(first, second);
+        if (larger <= 0f) {
+            return 0f;
+        }
+        return Math.min(first, second) / larger;
+    }
+
+    private List<Target> componentSwapTargets(int width, int height, float unit, List<Target> actions,
+                                              List<Target> texts, List<Target> imageButtons, List<Target> images) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : texts) {
+            addComponentSwapTarget(targets, target, width, height, unit);
+        }
+        for (Target target : actions) {
+            addComponentSwapTarget(targets, target, width, height, unit);
+        }
+        List<Target> contentImageTargets = contentImages(width, height, unit, images);
+        for (Target target : images) {
+            if (!isSmallImageComponent(width, height, unit, target.bounds)
+                    && !contentImageTargets.contains(target)) {
+                continue;
+            }
+            addComponentSwapTarget(targets, target, width, height, unit);
+        }
+        return targets;
+    }
+
+    private void addComponentSwapTarget(List<Target> targets, Target target, int width, int height, float unit) {
+        if (targets.size() >= MAX_TARGETS || hasSameView(targets, target)) {
+            return;
+        }
+        if (!isComponentSwapBounds(width, height, unit, target.bounds)) {
+            return;
+        }
+        targets.add(target);
+    }
+
+    private boolean hasSameView(List<Target> targets, Target candidate) {
+        for (Target target : targets) {
+            if (target.view == candidate.view) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isComponentSwapBounds(int width, int height, float unit, RectF bounds) {
+        if (bounds.width() < unit * 2f || bounds.height() < unit * 1.2f) {
+            return false;
+        }
+        if (bounds.width() > unit * 36f || bounds.height() > unit * 16f) {
+            return false;
+        }
+        return bounds.left >= 0f && bounds.right <= width && bounds.top >= 0f && bounds.bottom <= height;
+    }
+
+    private List<Target> textTargets(List<Target> editTexts, List<Target> texts) {
+        List<Target> targets = new ArrayList<>(texts);
+        for (Target target : editTexts) {
+            targets.add(target);
+        }
+        return targets;
+    }
+
+    private List<Target> lowContrastTargets(List<Target> editTexts, List<Target> texts, List<Target> actions) {
+        List<Target> targets = textTargets(editTexts, texts);
+        for (Target target : actions) {
+            if (target.text != null && !target.text.trim().isEmpty()) {
+                targets.add(target);
+            }
+        }
+        return targets;
+    }
+
+    private List<Target> iconDeletionTargets(List<Target> actions) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : actions) {
+            if ("image_button".equals(target.kind) || "image_action".equals(target.kind)) {
+                targets.add(target);
+            }
+        }
+        return targets;
+    }
+
+    private List<Target> componentResizeTargets(int width, int height, float unit, List<Target> actions,
+                                                List<Target> imageButtons, List<Target> images) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : actions) {
+            if (isTopAppBarTarget(target, unit) || !isResizableNonTextComponent(width, height, unit, target.bounds)) {
+                continue;
+            }
+            targets.add(target);
+        }
+        for (Target target : imageButtons) {
+            if (isResizableNonTextComponent(width, height, unit, target.bounds)) {
+                targets.add(target);
+            }
+        }
+        for (Target target : images) {
+            if (isSmallImageComponent(width, height, unit, target.bounds)) {
+                targets.add(target);
+            }
+        }
+        return targets;
+    }
+
+    private boolean isResizableNonTextComponent(int width, int height, float unit, RectF bounds) {
+        if (bounds.width() < unit * 2f || bounds.height() < unit * 1.4f) {
+            return false;
+        }
+        if (bounds.width() > unit * 24f || bounds.height() > unit * 12f) {
+            return false;
+        }
+        if (bounds.left < 0f || bounds.right > width || bounds.top < unit || bounds.bottom > height - unit * 3f) {
+            return false;
+        }
+        return true;
+    }
+
+    private boolean isSmallImageComponent(int width, int height, float unit, RectF bounds) {
+        if (!isResizableNonTextComponent(width, height, unit, bounds)) {
+            return false;
+        }
+        float longerSide = Math.max(bounds.width(), bounds.height());
+        float shorterSide = Math.min(bounds.width(), bounds.height());
+        return longerSide <= unit * 14f && (longerSide == 0f || shorterSide / longerSide >= 0.30f);
+    }
+
+    private RectF componentResizeDestination(RectF bounds, float unit, int seed, int width, int height) {
+        float scale = Math.abs(seed) % 2 == 0 ? 0.55f : 1.45f;
+        float destWidth = Math.max(unit * 1.2f, bounds.width() * scale);
+        float destHeight = Math.max(unit * 0.9f, bounds.height() * scale);
+        float left = bounds.left;
+        float top = bounds.centerY() - destHeight / 2f;
+        if (left + destWidth > width) {
+            left = Math.max(0f, bounds.right - destWidth);
+        }
+        if (top < 0f) {
+            top = 0f;
+        }
+        if (top + destHeight > height) {
+            top = Math.max(0f, height - destHeight);
+        }
+        return new RectF(left, top, Math.min(width, left + destWidth), Math.min(height, top + destHeight));
+    }
+
+    private List<Target> paddingShiftTargets(int width, int height, float unit, List<Target> actions,
+                                             List<Target> texts, int seed) {
+        List<Target> textTargets = paddingTextTargets(width, height, unit, texts, seed);
+        if (!textTargets.isEmpty()) {
+            return textTargets;
+        }
+
+        List<Target> actionTargets = new ArrayList<>();
+        for (Target target : actions) {
+            if (isTopAppBarTarget(target, unit) || target.text == null || target.text.trim().isEmpty()) {
+                continue;
+            }
+            RectF destination = paddingShiftDestination(target.bounds, unit, seed, width, height);
+            if (!overlapsText(target.bounds, texts, unit) && !overlapsText(destination, texts, unit)) {
+                actionTargets.add(target);
+            }
+        }
+        return actionTargets;
+    }
+
+    private List<Target> paddingTextTargets(int width, int height, float unit, List<Target> texts, int seed) {
+        List<Target> targets = new ArrayList<>();
+        for (Target target : texts) {
+            if (isTopAppBarTarget(target, unit)) {
+                continue;
+            }
+            RectF source = paddingShiftSource(target, unit, width, height);
+            RectF destination = paddingShiftDestination(source, unit, seed, width, height);
+            if (!overlapsOtherText(source, destination, target, texts, unit)) {
+                targets.add(target);
+            }
+        }
+        return targets;
+    }
+
+    private boolean isTopAppBarTarget(Target target, float unit) {
+        return target.bounds.top < 6.5f * unit;
+    }
+
+    private boolean overlapsOtherText(RectF source, RectF destination, Target selected, List<Target> texts,
+                                      float unit) {
+        for (Target text : texts) {
+            if (text == selected) {
+                continue;
+            }
+            if (significantOverlap(source, text.bounds, unit)
+                    || significantOverlap(destination, text.bounds, unit)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean overlapsText(RectF rect, List<Target> texts, float unit) {
+        for (Target text : texts) {
+            if (significantOverlap(rect, text.bounds, unit)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean significantOverlap(RectF first, RectF second, float unit) {
+        float left = Math.max(first.left, second.left);
+        float top = Math.max(first.top, second.top);
+        float right = Math.min(first.right, second.right);
+        float bottom = Math.min(first.bottom, second.bottom);
+        if (right <= left || bottom <= top) {
+            return false;
+        }
+        float overlapArea = (right - left) * (bottom - top);
+        float textArea = Math.max(1f, second.width() * second.height());
+        float minArea = Math.max(4f, unit * unit * 0.08f);
+        return overlapArea >= minArea && overlapArea / textArea >= 0.08f;
+    }
+
+    private RectF paddingShiftSource(Target target, float unit, int width, int height) {
+        return expand(target.bounds, unit / 4f, width, height);
+    }
+
+    private RectF paddingShiftDestination(RectF source, float unit, int seed, int width, int height) {
+        float shiftX = Math.min(2.4f * unit, Math.max(unit, source.width() * 0.18f));
+        if (source.right + shiftX > width) {
+            shiftX = -shiftX;
+        }
+        if (source.left + shiftX < 0f) {
+            shiftX = Math.abs(shiftX);
+        }
+        float shiftY = Math.abs(seed) % 3 == 0 ? unit * 0.45f : 0f;
+        if (source.bottom + shiftY > height) {
+            shiftY = -shiftY;
+        }
+        if (source.top + shiftY < 0f) {
+            shiftY = 0f;
+        }
+        return new RectF(source.left + shiftX, source.top + shiftY, source.right + shiftX,
+                source.bottom + shiftY);
+    }
+
+    private Rect bitmapRect(Bitmap bitmap, RectF bounds) {
+        if (bitmap == null || bitmap.isRecycled()) {
+            return new Rect();
+        }
+        return new Rect(
+                clamp(Math.round(bounds.left), 0, bitmap.getWidth()),
+                clamp(Math.round(bounds.top), 0, bitmap.getHeight()),
+                clamp(Math.round(bounds.right), 0, bitmap.getWidth()),
+                clamp(Math.round(bounds.bottom), 0, bitmap.getHeight()));
+    }
+
+    private void eraseTarget(Canvas canvas, Bitmap cleanFrame, RectF bounds, int fallbackBackground, float unit) {
         paint.setStyle(Paint.Style.FILL);
-        paint.setColor(background);
-        canvas.drawRect(expand(bounds, unit / 5f, width, height), paint);
-        paint.setColor(blend(background, target.foregroundColor, 0.6f));
-        canvas.drawCircle(bounds.centerX(), bounds.centerY(), radius, paint);
-        paint.setStyle(Paint.Style.STROKE);
-        paint.setStrokeWidth(unit / 5f);
-        paint.setColor(background);
-        canvas.drawLine(bounds.centerX() - radius / 2f, bounds.centerY(),
-                bounds.centerX() + radius / 2f, bounds.centerY(), paint);
-        canvas.drawLine(bounds.centerX(), bounds.centerY() - radius / 2f,
-                bounds.centerX(), bounds.centerY() + radius / 2f, paint);
+        paint.setAlpha(255);
+        paint.setColor(sampleBackgroundColor(cleanFrame, bounds, fallbackBackground, unit));
+        canvas.drawRect(bounds, paint);
     }
 
-    private RectF componentTargetBounds(int width, int height, float unit, List<Target> actions, List<Target> texts,
-                                        List<Target> images, int seed) {
-        return componentTarget(width, height, unit, actions, texts, images, seed).bounds;
+    private Bitmap textPixelBitmap(Bitmap cleanFrame, Rect source, int background, boolean erase) {
+        return visiblePixelBitmap(cleanFrame, source, background, erase);
     }
 
-    private Target componentTarget(int width, int height, float unit, List<Target> actions, List<Target> texts,
-                                   List<Target> images, int seed) {
-        if (!actions.isEmpty()) {
-            Target target = targetOrFallback(actions, targetIndex(actions, seed), width, height, unit);
-            return new Target(expand(target.bounds, unit / 2f, width, height), target.backgroundColor,
-                    target.foregroundColor, target.text, target.kind);
+    private Bitmap visiblePixelBitmap(Bitmap cleanFrame, Rect source, int background, boolean erase) {
+        int width = source.width();
+        int height = source.height();
+        if (width <= 0 || height <= 0) {
+            return null;
         }
-        if (!texts.isEmpty()) {
-            Target target = targetOrFallback(texts, targetIndex(texts, seed), width, height, unit);
-            return new Target(expand(target.bounds, unit / 2f, width, height), target.backgroundColor,
-                    target.foregroundColor, target.text, target.kind);
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] pixels = new int[width * height];
+        cleanFrame.getPixels(pixels, 0, width, source.left, source.top, width, height);
+        int threshold = 32;
+        for (int i = 0; i < pixels.length; i++) {
+            int color = pixels[i];
+            if (Color.alpha(color) < 180 || colorDistance(color, background) < threshold) {
+                pixels[i] = Color.TRANSPARENT;
+                continue;
+            }
+            if (erase) {
+                pixels[i] = background;
+            } else {
+                pixels[i] = forceOpaque(color);
+            }
         }
-        Target target = targetOrFallback(images, targetIndex(images, seed), width, height, unit);
-        return new Target(expand(target.bounds, unit / 2f, width, height), target.backgroundColor,
-                target.foregroundColor, target.text, target.kind);
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+        return bitmap;
+    }
+
+    private void recycleIfNotNull(Bitmap bitmap) {
+        if (bitmap != null) {
+            bitmap.recycle();
+        }
+    }
+
+    private Bitmap lowContrastTextBitmap(Bitmap cleanFrame, Rect source, int background) {
+        int width = source.width();
+        int height = source.height();
+        if (width <= 0 || height <= 0) {
+            return null;
+        }
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] pixels = new int[width * height];
+        cleanFrame.getPixels(pixels, 0, width, source.left, source.top, width, height);
+        int threshold = 32;
+        for (int i = 0; i < pixels.length; i++) {
+            int color = pixels[i];
+            if (Color.alpha(color) < 180 || colorDistance(color, background) < threshold) {
+                pixels[i] = Color.TRANSPARENT;
+                continue;
+            }
+            pixels[i] = blend(background, forceOpaque(color), 0.16f);
+        }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+        return bitmap;
+    }
+
+    private Bitmap recoloredVisibleBitmap(Bitmap cleanFrame, Rect source, int background, int replacement) {
+        int width = source.width();
+        int height = source.height();
+        if (width <= 0 || height <= 0) {
+            return null;
+        }
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        int[] pixels = new int[width * height];
+        cleanFrame.getPixels(pixels, 0, width, source.left, source.top, width, height);
+        int threshold = 32;
+        for (int i = 0; i < pixels.length; i++) {
+            int color = pixels[i];
+            if (Color.alpha(color) < 180 || colorDistance(color, background) < threshold) {
+                pixels[i] = Color.TRANSPARENT;
+                continue;
+            }
+            pixels[i] = Color.argb(Color.alpha(color), Color.red(replacement), Color.green(replacement),
+                    Color.blue(replacement));
+        }
+        bitmap.setPixels(pixels, 0, width, 0, 0, width, height);
+        return bitmap;
+    }
+
+    private int distinctMutationColor(int seed, int background, int current) {
+        int value = seed ^ (background * 31) ^ (current * 17);
+        for (int attempt = 0; attempt < 32; attempt++) {
+            value = value * 1103515245 + 12345 + attempt * 97;
+            float hue = positiveModulo(value, 360);
+            float saturation = 0.72f + (positiveModulo(value / 7, 27) / 100f);
+            float brightness = 0.55f + (positiveModulo(value / 11, 38) / 100f);
+            int candidate = Color.HSVToColor(new float[]{hue, Math.min(0.98f, saturation),
+                    Math.min(0.93f, brightness)});
+            if (isDistinctMutationColor(candidate, background, current)) {
+                return candidate;
+            }
+        }
+        int fallbackHue = positiveModulo(seed + 173, 360);
+        int candidate = Color.HSVToColor(new float[]{fallbackHue, 0.92f, 0.82f});
+        if (isDistinctMutationColor(candidate, background, current)) {
+            return candidate;
+        }
+        return Color.HSVToColor(new float[]{positiveModulo(fallbackHue + 268, 360), 0.95f, 0.78f});
+    }
+
+    private boolean isDistinctMutationColor(int color, int background, int current) {
+        return !isNeutralColor(color)
+                && colorDistance(color, background) >= 170
+                && colorDistance(color, current) >= 170;
+    }
+
+    private boolean isNeutralColor(int color) {
+        int red = Color.red(color);
+        int green = Color.green(color);
+        int blue = Color.blue(color);
+        int max = Math.max(red, Math.max(green, blue));
+        int min = Math.min(red, Math.min(green, blue));
+        return max < 45 || min > 225 || max - min < 35;
+    }
+
+    private int positiveModulo(int value, int modulo) {
+        int result = value % modulo;
+        return result < 0 ? result + modulo : result;
+    }
+
+    private int colorDistance(int first, int second) {
+        int red = Color.red(first) - Color.red(second);
+        int green = Color.green(first) - Color.green(second);
+        int blue = Color.blue(first) - Color.blue(second);
+        return Math.abs(red) + Math.abs(green) + Math.abs(blue);
     }
 
     private Target targetOrFallback(List<Target> targets, int index, int width, int height, float unit) {
@@ -491,6 +1195,37 @@ public class VisualMutationLayer extends View {
         } finally {
             bitmap.recycle();
         }
+    }
+
+    private Bitmap captureFrameWithHiddenView(View hiddenView, int width, int height) {
+        if (hiddenView == null) {
+            return null;
+        }
+        View viewToHide = smallClickableAncestor(hiddenView);
+        float previousAlpha = viewToHide.getAlpha();
+        viewToHide.setAlpha(0f);
+        try {
+            return captureCleanFrame(width, height);
+        } finally {
+            viewToHide.setAlpha(previousAlpha);
+        }
+    }
+
+    private View smallClickableAncestor(View view) {
+        View candidate = view;
+        while (candidate != null) {
+            if (candidate.isClickable() || candidate.isLongClickable()) {
+                Rect rect = new Rect();
+                if (candidate.getGlobalVisibleRect(rect)
+                        && rect.width() >= 24 && rect.height() >= 24
+                        && rect.width() <= 80 && rect.height() <= 80) {
+                    return candidate;
+                }
+            }
+            ViewParent parent = candidate.getParent();
+            candidate = parent instanceof View ? (View) parent : null;
+        }
+        return view;
     }
 
     private Bitmap captureCleanFrame(int width, int height) {
@@ -623,6 +1358,13 @@ public class VisualMutationLayer extends View {
         return Math.max(11f * density, Math.min(18f * density, bounds.height() * 0.48f));
     }
 
+    private float targetTextSize(Target target, RectF bounds, float density) {
+        if (target.textSize > 0f) {
+            return target.textSize;
+        }
+        return textSizeFor(bounds, density);
+    }
+
     private float textBaseline(RectF bounds) {
         Paint.FontMetrics metrics = paint.getFontMetrics();
         return bounds.centerY() - (metrics.ascent + metrics.descent) / 2f;
@@ -639,7 +1381,7 @@ public class VisualMutationLayer extends View {
     private List<Target> mergeTargets(List<Target> first, List<Target> second) {
         List<Target> merged = new ArrayList<>(first);
         for (Target bound : second) {
-            if (merged.size() >= 6) {
+            if (merged.size() >= MAX_TARGETS) {
                 break;
             }
             merged.add(bound);
@@ -658,34 +1400,37 @@ public class VisualMutationLayer extends View {
     }
 
     private void collectVisibleTargets(View view, Class<? extends View> viewClass, String kind, List<Target> targets) {
-        if (view == null || view == this || targets.size() >= 4 || view.getVisibility() != VISIBLE
+        if (view == null || view == this || targets.size() >= MAX_TARGETS || view.getVisibility() != VISIBLE
                 || view.getWidth() == 0 || view.getHeight() == 0) {
             return;
         }
-        if (viewClass.isInstance(view) && isEligibleTarget(view, viewClass)) {
+        if (viewClass.isInstance(view) && isEligibleTarget(view, viewClass, kind)) {
             Rect rect = new Rect();
             if (view.getGlobalVisibleRect(rect)) {
                 int[] layerLocation = new int[2];
                 getLocationOnScreen(layerLocation);
                 rect.offset(-layerLocation[0], -layerLocation[1]);
                 RectF bounds = new RectF(rect);
-                if (!isPlausibleTarget(view, viewClass, bounds)) {
+                if ("image_action".equals(kind)) {
+                    bounds = clickableImageActionBounds(view, bounds);
+                }
+                if (!isPlausibleTarget(view, viewClass, kind, bounds)) {
                     return;
                 }
                 String text = targetText(view);
                 targets.add(new Target(bounds, resolveBackgroundColor(view), resolveForegroundColor(view),
-                        text, kind));
+                        text, kind, targetTextSize(view), view));
             }
         }
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
-            for (int i = 0; i < group.getChildCount() && targets.size() < 4; i++) {
+            for (int i = 0; i < group.getChildCount() && targets.size() < MAX_TARGETS; i++) {
                 collectVisibleTargets(group.getChildAt(i), viewClass, kind, targets);
             }
         }
     }
 
-    private boolean isEligibleTarget(View view, Class<? extends View> viewClass) {
+    private boolean isEligibleTarget(View view, Class<? extends View> viewClass, String kind) {
         if (viewClass == TextView.class) {
             return !(view instanceof Button) && !(view instanceof EditText) && !targetText(view).isEmpty();
         }
@@ -701,7 +1446,59 @@ public class VisualMutationLayer extends View {
         return true;
     }
 
-    private boolean isPlausibleTarget(View view, Class<? extends View> viewClass, RectF bounds) {
+    private boolean isClickableImage(View view) {
+        if (view.isClickable() || view.isLongClickable()) {
+            return true;
+        }
+        ViewParent parent = view.getParent();
+        while (parent instanceof View) {
+            View parentView = (View) parent;
+            if (parentView.isClickable() || parentView.isLongClickable()) {
+                return true;
+            }
+            parent = parentView.getParent();
+        }
+        return false;
+    }
+
+    private RectF clickableImageActionBounds(View view, RectF fallback) {
+        View candidate = view;
+        while (candidate != null) {
+            if (candidate.isClickable() || candidate.isLongClickable()) {
+                Rect rect = new Rect();
+                if (candidate.getGlobalVisibleRect(rect)) {
+                    int[] layerLocation = new int[2];
+                    getLocationOnScreen(layerLocation);
+                    rect.offset(-layerLocation[0], -layerLocation[1]);
+                    RectF bounds = new RectF(rect);
+                    if (bounds.width() >= 24f && bounds.height() >= 24f
+                            && bounds.width() <= 80f && bounds.height() <= 80f) {
+                        return bounds;
+                    }
+                }
+            }
+            ViewParent parent = candidate.getParent();
+            candidate = parent instanceof View ? (View) parent : null;
+        }
+        return fallback;
+    }
+
+    private RectF viewBounds(View view, int width, int height) {
+        Rect rect = new Rect();
+        if (view == null || !view.getGlobalVisibleRect(rect)) {
+            return new RectF();
+        }
+        int[] layerLocation = new int[2];
+        getLocationOnScreen(layerLocation);
+        rect.offset(-layerLocation[0], -layerLocation[1]);
+        return new RectF(
+                Math.max(0f, rect.left),
+                Math.max(0f, rect.top),
+                Math.min(width, rect.right),
+                Math.min(height, rect.bottom));
+    }
+
+    private boolean isPlausibleTarget(View view, Class<? extends View> viewClass, String kind, RectF bounds) {
         if (bounds.width() < 16f || bounds.height() < 12f) {
             return false;
         }
@@ -716,7 +1513,13 @@ public class VisualMutationLayer extends View {
                     && ((ImageButton) view).getDrawable() != null;
         }
         if (viewClass == ImageView.class) {
-            return bounds.width() >= 24f && bounds.height() >= 24f
+            boolean smallIconImage = bounds.width() >= 16f && bounds.height() >= 16f
+                    && bounds.width() <= 80f && bounds.height() <= 80f
+                    && ((ImageView) view).getDrawable() != null;
+            if ("image_action".equals(kind)) {
+                return smallIconImage;
+            }
+            return !smallIconImage && bounds.width() >= 24f && bounds.height() >= 24f
                     && ((ImageView) view).getDrawable() != null;
         }
         return true;
@@ -733,6 +1536,13 @@ public class VisualMutationLayer extends View {
         }
         CharSequence hint = textView.getHint();
         return hint == null ? "" : hint.toString().trim();
+    }
+
+    private float targetTextSize(View view) {
+        if (view instanceof TextView) {
+            return ((TextView) view).getTextSize();
+        }
+        return 0f;
     }
 
     private int resolveForegroundColor(View view) {
